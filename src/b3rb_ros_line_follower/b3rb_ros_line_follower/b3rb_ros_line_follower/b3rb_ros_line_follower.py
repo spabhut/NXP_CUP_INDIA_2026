@@ -40,54 +40,61 @@ TURN_MAX = 1.0
 class LineFollower(Node):
     """
     Core controller Node for the B3RB buggy.
-    By default, it publishes a safe drive-straight command on a timer loop.
-    Implement logic inside the callbacks to steer, dodge obstacles, detect destinations,
-    communicate with the server, and park.
+    Implements a mission state machine on top of lane-following:
+    EN_ROUTE -> AWAITING_ZONE -> IN_ZONE
     """
+
+    # ------------------ Mission states ------------------
+    STATE_EN_ROUTE = 'EN_ROUTE'
+    STATE_AWAITING_ZONE = 'AWAITING_ZONE'
+    STATE_IN_ZONE = 'IN_ZONE'
+
+    # ------------------ LIDAR sectors (index range assuming a 360-sample scan; scaled otherwise) ------------------
+    LEFT_SECTOR = (210, 330)    # building/zone check, left side
+    RIGHT_SECTOR = (30, 150)    # building/zone check, right side
+
+    # ------------------ Thresholds ------------------
+    BUILDING_DIST_THRESHOLD = 1.0      # meters -- "close" for zone purposes
+    BUILDING_OCCUPANCY_RATIO = 0.75     # fraction of a side sector that must be "close" to call it a building
+
+    DEFAULT_SPEED = 0.5
+
     def __init__(self):
         super().__init__('line_follower')
 
         # ------------------ Subscriptions ------------------
-        
-        # 1. Lane Edge Vectors (from edge_vectors_publisher)
         self.subscription_vectors = self.create_subscription(
             EdgeVectors,
             '/edge_vectors',
             self.edge_vectors_callback,
             QOS_PROFILE_DEFAULT)
 
-        # 2. LIDAR Obstacle Scanner
         self.subscription_lidar = self.create_subscription(
             LaserScan,
             '/scan',
             self.lidar_callback,
             QOS_PROFILE_DEFAULT)
 
-        # 3. Server Communication Feedback Loop
         self.subscription_server = self.create_subscription(
             ServerCommunication,
             '/ServerCommunication',
             self.server_communication_callback,
             QOS_PROFILE_DEFAULT)
 
-        # 4. QR Code Detections (from qr_detector)
         self.subscription_qr = self.create_subscription(
             String,
             '/qr_detection',
             self.qr_detection_callback,
             QOS_PROFILE_DEFAULT)
 
-        # 5. Sign Board Detections (from object_recognizer)
         self.subscription_signs = self.create_subscription(
             String,
             '/sign_board_detection',
             self.sign_board_callback,
             QOS_PROFILE_DEFAULT)
 
-        # 6. Teleop Override Flag (from b3rb_ros_teleop)
-        # When True, a human is driving via keyboard teleop, so this node must
-        # NOT publish its own drive commands (both nodes write to
-        # /cerebri/in/joy, and without this check they'd fight each other).
+        # Teleop override: when True, a human is driving via keyboard teleop, so this
+        # node must NOT publish its own drive commands.
         self.subscription_teleop_override = self.create_subscription(
             Bool,
             '/teleop/override',
@@ -95,38 +102,34 @@ class LineFollower(Node):
             QOS_PROFILE_DEFAULT)
 
         # ------------------ Publishers ------------------
-        
-        # Publisher to drive/steer the buggy
         self.publisher_joy = self.create_publisher(
             Joy,
             '/cerebri/in/joy',
             QOS_PROFILE_DEFAULT)
 
-        # Publisher to send messages to the Server
         self.publisher_server = self.create_publisher(
             ServerCommunication,
             '/ServerCommunication',
             QOS_PROFILE_DEFAULT)
 
         # ------------------ State Variables & Timer ------------------
-        
-        # Default controls: drive straight slowly
-        self.target_speed = 0.15
+        self.target_speed = self.DEFAULT_SPEED
         self.target_turn = 0.0
+        self.teleop_active = False
 
-        # State variables (You can add your own state flags / state machines here)
-        self.obstacle_in_front = False
-        self.patient_id = None
-        self.hospital_id = None
-        self.current_destination = None
+        # Mission state machine
+        self.state = self.STATE_EN_ROUTE
+
+        # Mission target / QR tracking
+        self.current_destination = "HOSPITAL_1"   # set by server instructions, e.g. "PATIENT_1"
+        self.pending_qr_loc = None
         self.mission_completed = False
-        self.teleop_active = False  # True while a human has manual control
 
-        # Timer to publish drive commands at 10Hz
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
 
         self.get_logger().info("Line Follower controller initialized. Safe Drive-Straight Mode active.")
 
+    # ------------------ Drive helpers ------------------
     def publish_drive_commands(self):
         """Timer callback that periodically publishes the current speed and steer command."""
         if self.teleop_active:
@@ -143,6 +146,20 @@ class LineFollower(Node):
         """Helper to immediately set control speed and steering angle."""
         self.target_speed = float(max(min(speed, SPEED_MAX), -SPEED_MAX))
         self.target_turn = float(max(min(turn, TURN_MAX), -TURN_MAX))
+
+    # ------------------ LIDAR sector helpers ------------------
+    def _scale_indices(self, num_readings, start_idx_360, end_idx_360):
+        start = int(num_readings * start_idx_360 / 360.0)
+        end = int(num_readings * end_idx_360 / 360.0)
+        return start, end
+
+    def _sector_occupancy_ratio(self, ranges, num_readings, start_idx_360, end_idx_360, threshold):
+        start, end = self._scale_indices(num_readings, start_idx_360, end_idx_360)
+        sector = ranges[start:end]
+        if not sector:
+            return 0.0
+        close_count = sum(1 for r in sector if math.isfinite(r) and r < threshold)
+        return close_count / len(sector)
 
     # ------------------ Callback Implementations ------------------
 
@@ -174,11 +191,30 @@ class LineFollower(Node):
         - Write obstacle avoidance maneuvers (e.g. stop, steer left/right around the block, and merge back).
         - Use LIDAR side-ranges to verify distance to building/QR signs before patient pickup/hospital drop actions.
         """
-        # HINTS:
-        # num_readings = len(message.ranges)
-        # front_sector = message.ranges[int(num_readings * 7/18): int(num_readings * 11/18)]
-        # min_front_dist = min(front_sector)
-        pass
+        ranges = message.ranges
+        num_readings = len(ranges)
+        if num_readings == 0:
+            return
+
+        # --- Zone detection only matters once a matching QR has been seen ---
+        if self.state == self.STATE_AWAITING_ZONE:
+            left_ratio = self._sector_occupancy_ratio(
+                ranges, num_readings, *self.LEFT_SECTOR, threshold=self.BUILDING_DIST_THRESHOLD)
+            right_ratio = self._sector_occupancy_ratio(
+                ranges, num_readings, *self.RIGHT_SECTOR, threshold=self.BUILDING_DIST_THRESHOLD)
+
+            if left_ratio >= self.BUILDING_OCCUPANCY_RATIO or right_ratio >= self.BUILDING_OCCUPANCY_RATIO:
+                self._enter_zone()
+
+    def _enter_zone(self):
+        self.state = self.STATE_IN_ZONE
+        self.rover_move_manual_mode(0.0, 0.0)
+        self.get_logger().info(
+            f"In zone for {self.pending_qr_loc} -- stopping for action.")
+        # TODO: perform the actual pickup/drop action here if it's more than a pause.
+        # self.send_server_update(f"ARRIVED:{self.pending_qr_loc}")
+        # Stays in STATE_IN_ZONE indefinitely for now -- exiting this state will be
+        # wired up once server comms/ACK handling is added.
 
     def server_communication_callback(self, message):
         """
@@ -218,19 +254,43 @@ class LineFollower(Node):
     def qr_detection_callback(self, message):
         """
         Receives QR codes scanned from the buildings.
-        
+
         GUIDELINE (Patient/Hospital Identification):
-        - Parse the decoded string payload in `message.data` (e.g. "PATIENT_A", "HOSPITAL_B").
-        - If it matches your target destination, stop the vehicle close to the building (verify range using LIDAR),
-          perform the action (pick patient / drop patient), and communicate the arrival to the server.
+        - Only accepted while EN_ROUTE, and only if it matches self.current_destination.
+        - On match, moves to AWAITING_ZONE; lidar_callback then confirms which side
+          (left/right) the zone is on before actually stopping.
         """
         self.get_logger().info(f"Heard QR code: {message.data}")
-        pass
+
+        if self.state != self.STATE_EN_ROUTE:
+            return  # already busy with obstacle/zone handling -- ignore for now
+
+        loc = self._parse_qr_loc(message.data)
+        if loc is None:
+            return
+
+        if loc != self.current_destination:
+            self.get_logger().info(
+                f"Ignoring QR for {loc} -- not current target ({self.current_destination}).")
+            return
+
+        self.pending_qr_loc = loc
+        self.state = self.STATE_AWAITING_ZONE
+        self.get_logger().info(f"QR match for target {loc} -- watching for zone.")
+
+    def _parse_qr_loc(self, payload):
+        """
+        Adapt this to the actual QR payload encoding.
+        Placeholder assumes something like "LOC: PATIENT_1".
+        """
+        try:
+            return payload.split(': ')[-1].strip()
+        except Exception:
+            return None
 
     def sign_board_callback(self, message):
         """
         Receives traffic sign boards.
-        
         GUIDELINE (Sign Board Routing):
         - Use the detected signs to choose the quickest route at intersections.
         """
