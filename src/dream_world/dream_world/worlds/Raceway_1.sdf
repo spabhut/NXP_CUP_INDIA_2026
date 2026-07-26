@@ -162,7 +162,7 @@
 	
 
 	<!-- Patient 1 -->
-	<!--
+	
 	<include>
 		<uri>models://some_office</uri>
 		<name>home_1</name>
@@ -178,7 +178,7 @@
 		<name>patient_1</name>
 		<pose>-2 14 0 0 0 -0.7</pose>
 	</include>
-	-->
+	
 
 	
 	<!-- Patient 2 -->
@@ -222,7 +222,7 @@
 
 
 	<!-- Hospital 1 -->
-	<!--
+	
 	<include>
 		<uri>models://Hospital</uri>
 		<name>hospital_1</name>
@@ -238,7 +238,7 @@
 		<name>Parking_Lot_1</name>
 		<pose>4.19 -10.0 -0.01 0 0 1.55</pose>
 	</include>
-	-->
+	
 
 	
 	<!-- Hospital 2 -->

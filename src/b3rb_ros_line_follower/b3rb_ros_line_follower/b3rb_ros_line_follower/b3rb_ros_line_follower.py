@@ -18,7 +18,7 @@ from rclpy.node import Node
 import time
 import math
 from sensor_msgs.msg import Joy, LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from synapse_msgs.msg import EdgeVectors, ServerCommunication
 
 QOS_PROFILE_DEFAULT = 10
@@ -84,6 +84,16 @@ class LineFollower(Node):
             self.sign_board_callback,
             QOS_PROFILE_DEFAULT)
 
+        # 6. Teleop Override Flag (from b3rb_ros_teleop)
+        # When True, a human is driving via keyboard teleop, so this node must
+        # NOT publish its own drive commands (both nodes write to
+        # /cerebri/in/joy, and without this check they'd fight each other).
+        self.subscription_teleop_override = self.create_subscription(
+            Bool,
+            '/teleop/override',
+            self.teleop_override_callback,
+            QOS_PROFILE_DEFAULT)
+
         # ------------------ Publishers ------------------
         
         # Publisher to drive/steer the buggy
@@ -110,6 +120,7 @@ class LineFollower(Node):
         self.hospital_id = None
         self.current_destination = None
         self.mission_completed = False
+        self.teleop_active = False  # True while a human has manual control
 
         # Timer to publish drive commands at 10Hz
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
@@ -118,6 +129,11 @@ class LineFollower(Node):
 
     def publish_drive_commands(self):
         """Timer callback that periodically publishes the current speed and steer command."""
+        if self.teleop_active:
+            # A human is driving via keyboard teleop right now -- stay quiet
+            # so we don't fight teleop for control of /cerebri/in/joy.
+            return
+
         msg = Joy()
         msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]  # Manual override button configuration
         msg.axes = [0.0, self.target_speed, 0.0, self.target_turn]
@@ -189,6 +205,15 @@ class LineFollower(Node):
         server_msg.ack = 0
         server_msg.msg = text_msg
         self.publisher_server.publish(server_msg)
+
+    def teleop_override_callback(self, message):
+        """Tracks whether keyboard teleop currently has manual control."""
+        if message.data != self.teleop_active:
+            if message.data:
+                self.get_logger().info("Teleop override ENGAGED -- pausing autonomous drive commands.")
+            else:
+                self.get_logger().info("Teleop override RELEASED -- resuming autonomous drive commands.")
+        self.teleop_active = message.data
 
     def qr_detection_callback(self, message):
         """

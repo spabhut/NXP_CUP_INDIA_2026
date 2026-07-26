@@ -30,6 +30,7 @@ setup(
             'runner = b3rb_ros_line_follower.b3rb_ros_line_follower:main',
             'detect = b3rb_ros_line_follower.b3rb_ros_object_recog:main',
             'qr_detect = b3rb_ros_line_follower.b3rb_ros_qr_detector:main',
+            'teleop = b3rb_ros_line_follower.b3rb_ros_teleop:main',
         ],
     },
 )
