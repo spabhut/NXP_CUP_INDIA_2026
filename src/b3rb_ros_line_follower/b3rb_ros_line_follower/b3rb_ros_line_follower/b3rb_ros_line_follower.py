@@ -29,6 +29,15 @@ SPEED_MAX = 1.0
 TURN_MIN = -1.0
 TURN_MAX = 1.0
 
+# Lane-following PID gains.
+# error is normalized to roughly [-1, 1] (fraction of half-width), so gains
+# stay in a similar scale to TURN_MIN/TURN_MAX. Tune KP first, then KD to
+# damp oscillation; leave KI at 0 unless you see a persistent steady-state bias.
+LANE_KP = 1.2
+LANE_KI = 0.0
+LANE_KD = 0.3
+LANE_INTEGRAL_LIMIT = 1.0
+
 # CONFIGURATION:
 # The buggy is driven in manual mode by publishing standard controller Joy messages to /cerebri/in/joy.
 # The layout is: msg.axes = [0.0, speed, 0.0, turn]
@@ -116,6 +125,11 @@ class LineFollower(Node):
         self.target_turn = 0.0
         self.teleop_active = False
 
+        # Lane-following PID state (used by edge_vectors_callback).
+        self._lane_integral = 0.0
+        self._lane_prev_error = 0.0
+        self._last_turn = 0.0
+
         # Mission state machine
         self.state = self.STATE_EN_ROUTE
 
@@ -168,20 +182,78 @@ class LineFollower(Node):
 
     def edge_vectors_callback(self, message):
         """
-        Receives lane boundaries from the camera vector extractor.
-        
-        GUIDELINE (Lane Following):
-        - `message.vector_count` contains the number of active bounds seen (0, 1, or 2).
-        - `message.vector_1` and `message.vector_2` contain the points defining the bounds.
-        - You need to write logic to compute the centerline deviation and adjust `self.target_turn`.
-        - E.g., if only one line is seen, steer away from it to keep distance; if two lines are seen,
-          calculate the midpoint relative to the image width and steer to center the buggy.
+        Receives lane boundaries from the camera vector extractor and steers to
+        keep the buggy centered between the left/right track edges.
+
+        Uses the "top" (min-y / far) endpoint of each vector -- vector_X[0] --
+        rather than the bottom endpoint, so steering reacts slightly ahead of
+        the buggy's current position instead of only to what's directly beneath it.
+
+        IMPORTANT: vector_1 is NOT guaranteed to be the left boundary. The
+        publisher only assigns vector_1/vector_2 in [left, right] order when
+        BOTH sides are detected. When vector_count == 1, whichever single side
+        was found (left OR right) is placed in vector_1. So we classify each
+        vector by its x-position relative to image center rather than trusting
+        the index.
         """
-        # HINTS:
-        # width = message.image_width
-        # half_width = width / 2.0
-        # For now, we do not modify self.target_turn so the buggy continues straight.
-        pass
+        # Don't fight the zone-guard/parking logic once we've stopped for a QR/building.
+        if self.state == self.STATE_IN_ZONE:
+            return
+
+        width = message.image_width
+        half_width = width / 2.0
+
+        left_x = None
+        right_x = None
+
+        if message.vector_count >= 1:
+            x = message.vector_1[0].x
+            if x < half_width:
+                left_x = x
+            else:
+                right_x = x
+
+        if message.vector_count >= 2:
+            x = message.vector_2[0].x
+            if x < half_width:
+                left_x = x
+            else:
+                right_x = x
+
+        if left_x is not None and right_x is not None:
+            # Both boundaries visible -- true centerline midpoint.
+            midpoint = (left_x + right_x) / 2.0
+        elif left_x is not None:
+            # Only the left boundary visible -- treat the right image edge as a
+            # virtual boundary so we bias steering away from the left edge.
+            midpoint = (left_x + width) / 2.0
+        elif right_x is not None:
+            # Only the right boundary visible -- treat the left image edge (x=0)
+            # as a virtual boundary so we bias steering away from the right edge.
+            midpoint = right_x / 2.0
+        else:
+            # No boundaries detected at all (e.g. momentary dropout) -- hold the
+            # last computed steering instead of snapping back to straight, which
+            # would fight whatever curve we were already navigating.
+            self.target_turn = self._last_turn
+            return
+
+        # Normalize to roughly [-1, 1]. Positive error = track center is to the
+        # LEFT of image center -> steer left (positive turn), matching the Joy
+        # convention (axes[3] positive = left steer).
+        error = (half_width - midpoint) / half_width
+        self.target_turn = self._update_lane_pid(error)
+
+    def _update_lane_pid(self, error):
+        """PID step for lane centering. Returns a turn command clamped to [TURN_MIN, TURN_MAX]."""
+        self._lane_integral = max(min(self._lane_integral + error, LANE_INTEGRAL_LIMIT), -LANE_INTEGRAL_LIMIT)
+        derivative = error - self._lane_prev_error
+        self._lane_prev_error = error
+
+        turn = (LANE_KP * error) + (LANE_KI * self._lane_integral) + (LANE_KD * derivative)
+        turn = max(min(turn, TURN_MAX), TURN_MIN)
+        self._last_turn = turn
+        return turn
 
     def lidar_callback(self, message):
         """
