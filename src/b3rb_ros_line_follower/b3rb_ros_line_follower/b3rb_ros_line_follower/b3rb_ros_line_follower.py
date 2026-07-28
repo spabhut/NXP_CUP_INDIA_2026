@@ -147,6 +147,7 @@ class LineFollower(Node):
         self.latched_sign_direction = None
 
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
+        self.publish_target_destination(self.current_destination)
 
         self.get_logger().info("Line Follower controller initialized. Safe Drive-Straight Mode active.")
 
