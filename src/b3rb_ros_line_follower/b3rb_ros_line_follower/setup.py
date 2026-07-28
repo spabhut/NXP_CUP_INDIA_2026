@@ -14,7 +14,8 @@ setup(
     version='0.0.0',
     packages=find_packages(exclude=['test']),
     package_data={
-        package_name: ['*.h5'],
+        # CRITICAL: Include .tflite model files so colcon installs them
+        package_name: ['*.tflite', '*.h5'],
     },
     data_files=standard_data_files,
     install_requires=['setuptools'],
