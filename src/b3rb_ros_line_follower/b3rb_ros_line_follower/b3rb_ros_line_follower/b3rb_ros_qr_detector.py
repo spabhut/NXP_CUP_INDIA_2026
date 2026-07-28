@@ -22,10 +22,10 @@ import numpy as np
 # HINT: If you want to use pyzbar for QR code detection, you can install it using:
 # pip install pyzbar
 # And uncomment/import it here:
-# try:
-#     from pyzbar import pyzbar
-# except ImportError:
-#     pyzbar = None
+try:
+    from pyzbar import pyzbar
+except ImportError:
+    pyzbar = None
 
 class QRDetector(Node):
     """
@@ -55,8 +55,11 @@ class QRDetector(Node):
         # Convert compressed image message to OpenCV format
         np_arr = np.frombuffer(message.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        height, width = image.shape[:2]
+        upper_half = image[0:int(height/2), 0:width]
+        gray_image = cv2.cvtColor(upper_half, cv2.COLOR_BGR2GRAY)
 
-        qr_data = self.detect_qr_code(image)
+        qr_data = self.detect_qr_code(gray_image)
 
         if qr_data is not None:
             # Publish the decoded QR payload
