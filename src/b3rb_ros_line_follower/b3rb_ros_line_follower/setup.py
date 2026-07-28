@@ -30,9 +30,8 @@ setup(
             'vectors = b3rb_ros_line_follower.b3rb_ros_edge_vectors:main',
             'runner = b3rb_ros_line_follower.b3rb_ros_line_follower:main',
             'detect = b3rb_ros_line_follower.b3rb_ros_object_recog:main',
-            'b3rb_ros_object_recognizer = b3rb_ros_line_follower.b3rb_ros_object_recognizer:main',
             'qr_detect = b3rb_ros_line_follower.b3rb_ros_qr_detector:main',
-            'b3rb_teleop_wasd = b3rb_ros_line_follower.b3rb_teleop_wasd:main',
+            'teleop = b3rb_ros_line_follower.b3rb_ros_teleop:main',
         ],
     },
 )

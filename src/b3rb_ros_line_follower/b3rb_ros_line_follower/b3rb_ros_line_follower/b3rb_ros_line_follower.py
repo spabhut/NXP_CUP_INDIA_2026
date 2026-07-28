@@ -39,14 +39,13 @@ TURN_MAX = 1.0
 class LineFollower(Node):
     """
     Core controller Node for the B3RB buggy.
-    Implements a mission state machine on top of lane-following:
-    EN_ROUTE -> AWAITING_ZONE -> IN_ZONE -> EN_ROUTE
     """
 
     # ------------------ Mission states ------------------
     STATE_EN_ROUTE = 'EN_ROUTE'
     STATE_AWAITING_ZONE = 'AWAITING_ZONE'
     STATE_IN_ZONE = 'IN_ZONE'
+    STATE_SIGN_TURNING = 'SIGN_TURNING'
 
     # ------------------ LIDAR sectors (index range assuming a 360-sample scan; scaled otherwise) ------------------
     LEFT_SECTOR = (210, 330)    # building/zone check, left side
@@ -57,6 +56,16 @@ class LineFollower(Node):
     BUILDING_OCCUPANCY_RATIO = 0.75     # fraction of a side sector that must be "close" to call it a building
 
     DEFAULT_SPEED = 0.5
+
+    # ------------------ Destination name -> sign-board letter (per FAQ7) ------------------
+    DESTINATION_TO_SIGN = {
+        'PATIENT_1': 'A',
+        'PATIENT_2': 'B',
+        'PATIENT_3': 'C',
+        'HOSPITAL_1': 'X',
+        'HOSPITAL_2': 'Y',
+        'HOSPITAL_3': 'Z',
+    }
 
     def __init__(self):
         super().__init__('line_follower')
@@ -111,6 +120,11 @@ class LineFollower(Node):
             '/ServerCommunication',
             QOS_PROFILE_DEFAULT)
 
+        self.publisher_target_destination = self.create_publisher(
+            String,
+            '/target_destination',
+            QOS_PROFILE_DEFAULT)
+
         # ------------------ State Variables & Timer ------------------
         self.target_speed = self.DEFAULT_SPEED
         self.target_turn = 0.0
@@ -127,6 +141,10 @@ class LineFollower(Node):
         # Server comms tracking
         self.own_uid = 0              # rolling uid (0-255) for messages *we* originate
         self.awaiting_ack_uid = None  # uid of our own outgoing message we're still waiting to be ack'd
+
+        # Sign-board turn tracking: latched direction for the current STATE_SIGN_TURNING
+        # episode (reset / actual turn maneuver TBD later).
+        self.latched_sign_direction = None
 
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
 
@@ -248,9 +266,26 @@ class LineFollower(Node):
             self.current_destination = raw_msg
             self.get_logger().info(f"New destination assigned: {self.current_destination}")
 
+            self.publish_target_destination(self.current_destination)
+
             self.pending_qr_loc = None
             self.state = self.STATE_EN_ROUTE
             self.target_speed = self.DEFAULT_SPEED
+
+    def publish_target_destination(self, destination_name):
+        """Maps a destination name (e.g. 'PATIENT_1', 'HOSPITAL_2') to its sign-board
+        letter (per FAQ7) and publishes it to /target_destination for the object
+        recognizer node to watch for."""
+        sign_letter = self.DESTINATION_TO_SIGN.get(destination_name)
+        if sign_letter is None:
+            self.get_logger().warn(
+                f"No sign-letter mapping for destination '{destination_name}' -- not publishing target.")
+            return
+
+        msg = String()
+        msg.data = sign_letter
+        self.publisher_target_destination.publish(msg)
+        self.get_logger().info(f"Published target_destination: '{sign_letter}' (for {destination_name})")
 
     def send_server_update(self, text_msg):
         """Sends status messages to the server. (Do not forget to send ACK messages to server)"""
@@ -299,10 +334,10 @@ class LineFollower(Node):
         - If it matches your target destination, stop the vehicle close to the building (verify range using LIDAR),
           perform the action (pick patient / drop patient), and communicate the arrival to the server.
         """
-        self.get_logger().info(f"Heard QR code: {message.data}")
-
         if self.state != self.STATE_EN_ROUTE:
             return  # already busy with obstacle/zone handling -- ignore for now
+
+        self.get_logger().info(f"Heard QR code: {message.data}")
 
         loc = self._parse_qr_loc(message.data)
         if loc is None:
@@ -323,18 +358,32 @@ class LineFollower(Node):
         Placeholder assumes something like "LOC: PATIENT_1".
         """
         try:
-            return payload.split(': ')[-1].strip()
+            return payload.split(': ')[-1].strip().strip('}')
         except Exception:
             return None
 
     def sign_board_callback(self, message):
         """
-        Receives traffic sign boards.
+        Receives traffic sign boards (e.g. "TURN_LEFT", "TURN_RIGHT", "TURN_STRAIGHT"
+        from the object recognizer).
+
         GUIDELINE (Sign Board Routing):
         - Use the detected signs to choose the quickest route at intersections.
+
+        Latching behavior: only act on a sign command while we're EN_ROUTE. The
+        first one we see moves us into STATE_SIGN_TURNING and latches the
+        direction; every sign message after that is ignored until something
+        moves us back out of STATE_SIGN_TURNING (the actual turn maneuver and
+        the reset back to EN_ROUTE are not implemented yet -- TBD).
         """
+        if self.state != self.STATE_EN_ROUTE:
+            return
+        
         self.get_logger().info(f"Heard Sign Board: {message.data}")
-        pass
+
+        self.latched_sign_direction = message.data
+        self.state = self.STATE_SIGN_TURNING
+        self.get_logger().info(f"Latched sign direction: '{self.latched_sign_direction}'.")
 
 def main(args=None):
     rclpy.init(args=args)
