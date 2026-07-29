@@ -49,6 +49,14 @@ SLOPE_ANGLE_NORMAL_DEG = 60.0   # >= this angle from horizontal -> normal single
 SLOPE_ANGLE_SHARP_DEG = 45.0    # < this angle from horizontal -> sharp-turn maneuver
 SHARP_TURN_MAGNITUDE = 0.8      # fixed turn command applied while executing the sharp turn
 
+# Sign-board turn maneuver (used by edge_vectors_callback + sign_board_callback).
+# Once a sign is latched, drive straight to the intersection center (vector_count
+# hits 0), then commit to a fixed turn (or go straight through, for TURN_STRAIGHT).
+SIGN_LEFT = 'TURN_LEFT'
+SIGN_RIGHT = 'TURN_RIGHT'
+SIGN_STRAIGHT = 'TURN_STRAIGHT'
+SIGN_TURN_MAGNITUDE = 0.8       # fixed turn command applied while executing a sign-board turn
+
 # CONFIGURATION:
 # The buggy is driven in manual mode by publishing standard controller Joy messages to /cerebri/in/joy.
 # The layout is: msg.axes = [0.0, speed, 0.0, turn]
@@ -61,21 +69,21 @@ class LineFollower(Node):
     Core controller Node for the B3RB buggy.
     """
 
-    # ------------------ Mission states ------------------
+    # ------------------ Mission states (self.state) ------------------
+    # Tracks zone/QR progress -- set by qr_detection_callback / lidar_callback /
+    # server_communication_callback. Unrelated to steering.
     STATE_EN_ROUTE = 'EN_ROUTE'
     STATE_AWAITING_ZONE = 'AWAITING_ZONE'
     STATE_IN_ZONE = 'IN_ZONE'
-    STATE_SIGN_TURNING = 'SIGN_TURNING'
 
-    # ------------------ Steering states (edge_vectors_callback) ------------------
-    # Normal PID lane-centering reuses STATE_EN_ROUTE above (2 vectors, or
-    # 1 vector with a steep slope). These two cover the sharp-turn maneuver:
-    # SHARP_WAITING -> 1 near-horizontal vector seen; driving straight until
-    #     its top and bottom points land on the same side of half_width.
-    # SHARP_TURNING -> committed to the turn; steering hard until both
-    #     vectors are visible again.
-    SHARP_WAITING = 'SHARP_WAITING'
-    SHARP_TURNING = 'SHARP_TURNING'
+    # ------------------ Lane states (self.lane_state) ------------------
+    # Drives steering strategy -- set by edge_vectors_callback (lane/sharp-turn
+    # handling) and sign_board_callback (sign-turn handling).
+    STATE_LANE = 'LANE'                   # normal PID lane-centering
+    STATE_SHARP_WAITING = 'SHARP_WAITING' # 1 near-horizontal vector; driving straight, waiting to commit
+    STATE_SHARP_TURNING = 'SHARP_TURNING' # committed to a sharp turn; steering hard until both vectors return
+    STATE_SIGN_WAITING = 'SIGN_WAITING'   # sign latched; driving straight to the intersection center
+    STATE_SIGN_TURNING = 'SIGN_TURNING'   # committed to a sign-board turn (or straight-through) maneuver
 
     # ------------------ LIDAR sectors (index range assuming a 360-sample scan; scaled otherwise) ------------------
     LEFT_SECTOR = (210, 330)    # building/zone check, left side
@@ -85,7 +93,7 @@ class LineFollower(Node):
     BUILDING_DIST_THRESHOLD = 2      # meters -- "close" for zone purposes
     BUILDING_OCCUPANCY_RATIO = 0.75     # fraction of a side sector that must be "close" to call it a building
 
-    DEFAULT_SPEED = 0.5
+    DEFAULT_SPEED = 0.4
 
     # ------------------ Destination name -> sign-board letter (per FAQ7) ------------------
     DESTINATION_TO_SIGN = {
@@ -165,13 +173,13 @@ class LineFollower(Node):
         self._lane_prev_error = 0.0
         self._last_turn = 0.0
 
-        # Sharp-turn maneuver state (used by edge_vectors_callback).
-        # steer_state drives which steering strategy runs each frame -- see
-        # the state constants above for what each value means.
-        self.steer_state = self.STATE_EN_ROUTE
+        # Lane state machine (used by edge_vectors_callback) -- separate from
+        # the mission state machine below. lane_state drives which steering
+        # strategy runs each frame -- see the lane state constants above.
+        self.lane_state = self.STATE_LANE
         self.turn_dir = 0.0   # +1.0 (turn left) / -1.0 (turn right), latched for the current sharp turn
 
-        # Mission state machine
+        # Mission state machine -- zone/QR progress, separate from lane_state above.
         self.state = self.STATE_EN_ROUTE
 
         # Mission target / QR tracking
@@ -183,8 +191,7 @@ class LineFollower(Node):
         self.own_uid = 0              # rolling uid (0-255) for messages *we* originate
         self.awaiting_ack_uid = None  # uid of our own outgoing message we're still waiting to be ack'd
 
-        # Sign-board turn tracking: latched direction for the current STATE_SIGN_TURNING
-        # episode (reset / actual turn maneuver TBD later).
+        # Sign-board turn tracking: latched direction (TURN_LEFT/TURN_RIGHT/TURN_STRAIGHT) for the current STATE_SIGN_WAITING/STATE_SIGN_TURNING episode.
         self.latched_sign_direction = None
 
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
@@ -231,12 +238,21 @@ class LineFollower(Node):
         Receives lane boundaries from the camera vector extractor and steers to
         keep the buggy centered between the left/right track edges.
 
-        Steering runs as a small state machine over self.steer_state:
-        - STATE_EN_ROUTE: normal PID lane-centering (see _steer_pid).
-        - SHARP_WAITING: one near-horizontal vector seen -- drive straight
-          until its top and bottom points land on the same side of half_width.
-        - SHARP_TURNING: committed to the turn -- steer hard until both
-          vectors are visible again.
+        Steering runs as a small state machine over self.lane_state (separate
+        from the mission state machine in self.state):
+        - STATE_LANE: normal PID lane-centering (see _steer_pid).
+        - STATE_SHARP_WAITING: one near-horizontal vector seen, its top and
+          bottom points still on the same side of half_width -- drive
+          straight until they disagree.
+        - STATE_SHARP_TURNING: top/bottom points disagree (the boundary is
+          crossing the middle) -- steer hard until both vectors are visible again.
+        - STATE_SIGN_WAITING: a sign direction was latched by sign_board_callback
+          -- drive straight until no lane vectors are visible at all (buggy is
+          centered on the intersection).
+        - STATE_SIGN_TURNING: committed to the latched sign-board direction --
+          turn_dir is +1 (left/CCW), -1 (right/CW), or 0 (TURN_STRAIGHT, drive
+          straight through) -- held until both vectors are visible again (lane
+          picked back up).
 
         Uses the "top" (min-y / far) endpoint of each vector -- vector_X[0] --
         rather than the bottom endpoint, so PID steering reacts slightly ahead
@@ -257,14 +273,14 @@ class LineFollower(Node):
         width = message.image_width
         half_width = width / 2.0
 
-        if message.vector_count >= 2:
-            self.steer_state = self.STATE_EN_ROUTE
+        if message.vector_count >= 2 and self.lane_state != self.STATE_SIGN_WAITING:
+            self.lane_state = self.STATE_LANE
 
-        elif message.vector_count == 1:
+        elif message.vector_count == 1 and self.lane_state != self.STATE_SIGN_WAITING:
             top_left = message.vector_1[0].x < half_width
             bottom_left = message.vector_1[1].x < half_width
 
-            if self.steer_state == self.STATE_EN_ROUTE:
+            if self.lane_state == self.STATE_LANE:
                 slope_deg = self._vector_slope_angle_deg(
                     message.vector_1[0].x, message.vector_1[0].y,
                     message.vector_1[1].x, message.vector_1[1].y)
@@ -275,24 +291,44 @@ class LineFollower(Node):
                     # boundary biases us to turn right, a right boundary
                     # biases us to turn left.
                     self.turn_dir = -1.0 if bottom_left else 1.0
-                    # If top and bottom already agree on a side, the vector
-                    # isn't actually ambiguous -- commit to the turn right
-                    # away. Otherwise wait for them to agree before turning.
-                    self.steer_state = (
-                        self.SHARP_TURNING if top_left != bottom_left else self.SHARP_WAITING)
+                    self.lane_state = (
+                        self.STATE_SHARP_WAITING if top_left == bottom_left
+                        else self.STATE_SHARP_TURNING)
                 # slope_deg >= SLOPE_ANGLE_SHARP_DEG (includes the ambiguous
-                # 45-60 band) -- stay EN_ROUTE, normal single-side PID handles it.
+                # 45-60 band) -- stay STATE_LANE, normal single-side PID handles it.
 
-            elif self.steer_state == self.SHARP_WAITING and top_left != bottom_left:
-                self.steer_state = self.SHARP_TURNING
+            elif self.lane_state == self.STATE_SHARP_WAITING and top_left != bottom_left:
+                self.lane_state = self.STATE_SHARP_TURNING
 
-            # SHARP_TURNING: nothing to update here -- only exits via vector_count >= 2 above.
+            # STATE_SHARP_TURNING / STATE_SIGN_WAITING / STATE_SIGN_TURNING:
+            # nothing to update here. STATE_SHARP_TURNING and STATE_SIGN_TURNING
+            # exit via vector_count >= 2 above; STATE_SIGN_WAITING only exits via
+            # vector_count == 0 below (2 vectors are intentionally ignored while
+            # waiting -- see the vector_count >= 2 check above).
 
-        if self.steer_state == self.STATE_EN_ROUTE:
+        elif message.vector_count == 0 and self.lane_state == self.STATE_SIGN_WAITING:
+            # Centered on the intersection -- commit to the latched sign turn.
+            # STRAIGHT goes through STATE_SIGN_TURNING too, just with a
+            # turn_dir of 0 (drive straight through), so the intersection is
+            # always fully crossed via one consistent maneuver before the
+            # vector_count >= 2 rule above hands back to STATE_LANE.
+            if self.latched_sign_direction == SIGN_LEFT:
+                self.turn_dir = 1.0
+            elif self.latched_sign_direction == SIGN_RIGHT:
+                self.turn_dir = -1.0
+            else:
+                self.turn_dir = 0.0
+            self.lane_state = self.STATE_SIGN_TURNING
+
+        if self.lane_state == self.STATE_LANE:
             turn = self._steer_pid(message, width, half_width)
-        elif self.steer_state == self.SHARP_WAITING:
-            turn = 0.0  # drive straight ahead until top/bottom agree on a side
-        else:  # SHARP_TURNING
+        elif self.lane_state == self.STATE_SHARP_WAITING:
+            turn = 0.0  # drive straight ahead until top/bottom disagree
+        elif self.lane_state == self.STATE_SIGN_WAITING:
+            turn = 0.0  # drive straight ahead until the intersection center
+        elif self.lane_state == self.STATE_SIGN_TURNING:
+            turn = self.turn_dir * SIGN_TURN_MAGNITUDE
+        else:  # STATE_SHARP_TURNING
             turn = self.turn_dir * SHARP_TURN_MAGNITUDE
 
         self.rover_move_manual_mode(self.target_speed, turn)
@@ -532,19 +568,20 @@ class LineFollower(Node):
         GUIDELINE (Sign Board Routing):
         - Use the detected signs to choose the quickest route at intersections.
 
-        Latching behavior: only act on a sign command while we're EN_ROUTE. The
-        first one we see moves us into STATE_SIGN_TURNING and latches the
-        direction; every sign message after that is ignored until something
-        moves us back out of STATE_SIGN_TURNING (the actual turn maneuver and
-        the reset back to EN_ROUTE are not implemented yet -- TBD).
+        Latching behavior: only act on sign commands while lane_state is
+        STATE_LANE (normal driving, no sharp-turn or other sign-turn already in
+        progress). latching the direction and moving lane_state to
+        STATE_SIGN_WAITING; edge_vectors_callback then drives to the intersection
+        center and executes the turn (see edge_vectors_callback for
+        STATE_SIGN_WAITING / STATE_SIGN_TURNING).
         """
-        if self.state != self.STATE_EN_ROUTE:
+        if self.lane_state != self.STATE_LANE:
             return
         
         self.get_logger().info(f"Heard Sign Board: {message.data}")
 
         self.latched_sign_direction = message.data
-        self.state = self.STATE_SIGN_TURNING
+        self.lane_state = self.STATE_SIGN_WAITING
         self.get_logger().info(f"Latched sign direction: '{self.latched_sign_direction}'.")
 
 def main(args=None):
