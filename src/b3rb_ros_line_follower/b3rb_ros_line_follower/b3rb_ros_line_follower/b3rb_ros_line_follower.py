@@ -55,7 +55,8 @@ SHARP_TURN_MAGNITUDE = 0.8      # fixed turn command applied while executing the
 SIGN_LEFT = 'TURN_LEFT'
 SIGN_RIGHT = 'TURN_RIGHT'
 SIGN_STRAIGHT = 'TURN_STRAIGHT'
-SIGN_TURN_MAGNITUDE = 0.8       # fixed turn command applied while executing a sign-board turn
+SIGN_TURN_MAGNITUDE = 0.5
+SIGN_TURN_SPEED = 0.8         # fixed turn command applied while executing a sign-board turn
 
 # CONFIGURATION:
 # The buggy is driven in manual mode by publishing standard controller Joy messages to /cerebri/in/joy.
@@ -273,54 +274,71 @@ class LineFollower(Node):
         width = message.image_width
         half_width = width / 2.0
 
-        if message.vector_count >= 2 and self.lane_state != self.STATE_SIGN_WAITING:
-            self.lane_state = self.STATE_LANE
+        # --- Outer branch: SIGN_WAITING is checked first, on its own,
+        # regardless of vector_count. Every other lane_state is then handled
+        # by branching on vector_count (>=2 / ==1 / ==0). This mirrors the
+        # decision order 1) SIGN_WAITING? -> check vector_count==0,
+        # else -> 2) vector_count>=2 -> PID/normal lane,
+        #         3) vector_count==1 -> sharp-turn check. ---
+        if self.lane_state == self.STATE_SIGN_WAITING:
+            if message.vector_count == 0:
+                # Centered on the intersection -- commit to the latched sign turn.
+                # STRAIGHT goes through STATE_SIGN_TURNING too, just with a
+                # turn_dir of 0 (drive straight through), so the intersection is
+                # always fully crossed via one consistent maneuver before the
+                # vector_count >= 2 rule below hands back to STATE_LANE.
+                if self.latched_sign_direction == SIGN_LEFT:
+                    self.turn_dir = 1.0
+                elif self.latched_sign_direction == SIGN_RIGHT:
+                    self.turn_dir = -1.0
+                else:
+                    self.turn_dir = 0.0
+                self.lane_state = self.STATE_SIGN_TURNING
+            # vector_count >= 1 while SIGN_WAITING: intentionally ignored --
+            # keep driving straight until the intersection center (vector_count == 0).
 
-        elif message.vector_count == 1 and self.lane_state != self.STATE_SIGN_WAITING:
-            top_left = message.vector_1[0].x < half_width
-            bottom_left = message.vector_1[1].x < half_width
+        else:
+            if message.vector_count >= 2:
+                self.lane_state = self.STATE_LANE
 
-            if self.lane_state == self.STATE_LANE:
-                slope_deg = self._vector_slope_angle_deg(
-                    message.vector_1[0].x, message.vector_1[0].y,
-                    message.vector_1[1].x, message.vector_1[1].y)
-                if slope_deg < SLOPE_ANGLE_SHARP_DEG:
-                    # Near-horizontal -- use the BOTTOM point (the TOP point
-                    # is unreliable here) to latch which way to turn. Same
-                    # convention as the single-side PID bias below: a left
-                    # boundary biases us to turn right, a right boundary
-                    # biases us to turn left.
-                    self.turn_dir = -1.0 if bottom_left else 1.0
-                    self.lane_state = (
-                        self.STATE_SHARP_WAITING if top_left == bottom_left
-                        else self.STATE_SHARP_TURNING)
-                # slope_deg >= SLOPE_ANGLE_SHARP_DEG (includes the ambiguous
-                # 45-60 band) -- stay STATE_LANE, normal single-side PID handles it.
+            elif message.vector_count == 1:
+                top_left = message.vector_1[0].x < half_width
+                bottom_left = message.vector_1[1].x < half_width
 
-            elif self.lane_state == self.STATE_SHARP_WAITING and top_left != bottom_left:
-                self.lane_state = self.STATE_SHARP_TURNING
+                if self.lane_state == self.STATE_LANE:
+                    # Check if this single boundary indicates a sharp turn or not.
+                    slope_deg = self._vector_slope_angle_deg(
+                        message.vector_1[0].x, message.vector_1[0].y,
+                        message.vector_1[1].x, message.vector_1[1].y)
+                    if slope_deg < SLOPE_ANGLE_SHARP_DEG:
+                        # Near-horizontal -- use the BOTTOM point (the TOP point
+                        # is unreliable here) to latch which way to turn. Same
+                        # convention as the single-side PID bias below: a left
+                        # boundary biases us to turn right, a right boundary
+                        # biases us to turn left.
+                        self.turn_dir = -1.0 if bottom_left else 1.0
+                        self.lane_state = (
+                            self.STATE_SHARP_WAITING if top_left == bottom_left
+                            else self.STATE_SHARP_TURNING)
+                    # slope_deg >= SLOPE_ANGLE_SHARP_DEG (includes the ambiguous
+                    # 45-60 band) -- not a sharp turn, stay STATE_LANE, normal
+                    # single-side PID handles it.
 
-            # STATE_SHARP_TURNING / STATE_SIGN_WAITING / STATE_SIGN_TURNING:
-            # nothing to update here. STATE_SHARP_TURNING and STATE_SIGN_TURNING
-            # exit via vector_count >= 2 above; STATE_SIGN_WAITING only exits via
-            # vector_count == 0 below (2 vectors are intentionally ignored while
-            # waiting -- see the vector_count >= 2 check above).
+                elif self.lane_state == self.STATE_SHARP_WAITING and top_left != bottom_left:
+                    self.lane_state = self.STATE_SHARP_TURNING
 
-        elif message.vector_count == 0 and self.lane_state == self.STATE_SIGN_WAITING:
-            # Centered on the intersection -- commit to the latched sign turn.
-            # STRAIGHT goes through STATE_SIGN_TURNING too, just with a
-            # turn_dir of 0 (drive straight through), so the intersection is
-            # always fully crossed via one consistent maneuver before the
-            # vector_count >= 2 rule above hands back to STATE_LANE.
-            if self.latched_sign_direction == SIGN_LEFT:
-                self.turn_dir = 1.0
-            elif self.latched_sign_direction == SIGN_RIGHT:
-                self.turn_dir = -1.0
-            else:
-                self.turn_dir = 0.0
-            self.lane_state = self.STATE_SIGN_TURNING
+                # STATE_SHARP_TURNING: nothing to update here -- it exits via
+                # vector_count >= 2 above.
+
+            # vector_count == 0 and lane_state not SIGN_WAITING: nothing to
+            # update here -- STATE_SHARP_WAITING/STATE_SHARP_TURNING/STATE_LANE
+            # all just fall through to the turn-command section below.
 
         if self.lane_state == self.STATE_LANE:
+            # Normal lane state -- always run at the default cruising speed.
+            # This is what brings speed back down to DEFAULT_SPEED (0.4) after
+            # a sign-board turn, which raises it to SIGN_TURN_SPEED (0.8).
+            self.target_speed = self.DEFAULT_SPEED
             turn = self._steer_pid(message, width, half_width)
         elif self.lane_state == self.STATE_SHARP_WAITING:
             turn = 0.0  # drive straight ahead until top/bottom disagree
@@ -328,6 +346,7 @@ class LineFollower(Node):
             turn = 0.0  # drive straight ahead until the intersection center
         elif self.lane_state == self.STATE_SIGN_TURNING:
             turn = self.turn_dir * SIGN_TURN_MAGNITUDE
+            self.target_speed = SIGN_TURN_SPEED
         else:  # STATE_SHARP_TURNING
             turn = self.turn_dir * SHARP_TURN_MAGNITUDE
 
