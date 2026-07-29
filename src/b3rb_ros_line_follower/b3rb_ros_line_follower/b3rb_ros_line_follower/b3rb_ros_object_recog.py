@@ -143,9 +143,19 @@ class ObjectRecognizer(Node):
             self.publisher_debug.publish(debug_msg)
 
     def classify_and_pair(self, image):
-        """Object detection with strict vertical alignment pairing."""
+        """
+        Full-Feed Object Detection & Pairing (No Cropping):
+        1. Resizes the entire camera image directly to model input shape.
+        2. Runs inference on full frame.
+        3. remaps relative detection coordinates cleanly to full image (w, h).
+        4. Applies strict vertical alignment pairing (Arrow below Target Letter).
+        """
         h, w, _ = image.shape
         debug_frame = image.copy()
+
+        # Model target input dimensions (e.g., width=320, height=320)
+        target_w = self.input_shape[2]
+        target_h = self.input_shape[1]
 
         # Display target status on debug overlay
         status_text = f"Target: {self.target_destination if self.target_destination else 'NONE'}"
@@ -153,38 +163,35 @@ class ObjectRecognizer(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
         try:
-            # 1. Preprocess image (320x320 RGB)
+            # =====================================================================
+            # 1. Preprocess Full Image Feed (BGR -> RGB -> Resize)
+            # =====================================================================
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            resized_image = cv2.resize(rgb_image, (self.input_shape[2], self.input_shape[1]))
-            input_data = np.expand_dims(resized_image, axis=0)
+            resized_full = cv2.resize(rgb_image, (target_w, target_h))
+
+            input_data = np.expand_dims(resized_full, axis=0)
 
             if self.input_details[0]['dtype'] == np.uint8:
                 input_data = input_data.astype(np.uint8)
             else:
                 input_data = (input_data.astype(np.float32) - 127.5) / 127.5
 
-            # 2. Run Inference
+            # =====================================================================
+            # 2. Run Single-Pass Inference on Full Frame
+            # =====================================================================
             self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
             self.interpreter.invoke()
 
-            # 3. Dynamic Output Parsing
-            boxes, classes, scores = None, None, None
-            for detail in self.output_details:
-                tensor = np.squeeze(self.interpreter.get_tensor(detail['index']))
-                if tensor.ndim == 2 and tensor.shape[1] == 4:
-                    boxes = tensor
-                elif tensor.ndim == 1 and tensor.size > 1:
-                    if np.issubdtype(tensor.dtype, np.integer) or np.all(np.mod(tensor, 1) == 0):
-                        classes = tensor
-                    else:
-                        scores = tensor
+            boxes, classes, scores = self._parse_tflite_outputs()
 
             if boxes is None or classes is None or scores is None:
                 return None, debug_frame
 
             detected_objects = []
 
-            # 4. Extract Detected Bounding Boxes
+            # =====================================================================
+            # 3. Extract Detected Bounding Boxes Across Full Image Scale
+            # =====================================================================
             for i in range(len(scores)):
                 score = float(scores[i])
                 if score >= self.confidence_threshold:
@@ -192,6 +199,7 @@ class ObjectRecognizer(Node):
                     label = self.labels.get(class_id, f"ID:{class_id}")
                     ymin, xmin, ymax, xmax = boxes[i]
 
+                    # Map normalized coordinates directly to full image width & height
                     pixel_xmin = int(xmin * w)
                     pixel_ymin = int(ymin * h)
                     pixel_xmax = int(xmax * w)
@@ -207,38 +215,40 @@ class ObjectRecognizer(Node):
                         'bbox': (pixel_xmin, pixel_ymin, pixel_xmax, pixel_ymax)
                     })
 
-                    # Draw detected bounding box
+                    # Draw detected bounding box onto debug_frame
                     cv2.rectangle(debug_frame, (pixel_xmin, pixel_ymin), (pixel_xmax, pixel_ymax), (0, 255, 0), 2)
                     cv2.putText(debug_frame, f"{label} {score:.2f}",
                                 (pixel_xmin, max(pixel_ymin - 10, 20)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            # 5. STRICT VERTICAL ALIGNMENT PAIRING
+            # =====================================================================
+            # 4. STRICT VERTICAL ALIGNMENT PAIRING
+            # =====================================================================
             if self.target_destination is not None:
-                # Locate target destination letter object
+                # Find target destination letter in detected objects
                 target_obj = next((obj for obj in detected_objects if obj['label'] == self.target_destination), None)
 
                 if target_obj is not None:
                     t_xmin, t_ymin, t_xmax, t_ymax = target_obj['bbox']
                     t_cx, t_cy = target_obj['center']
 
-                    # Allow a small horizontal padding margin (15 pixels)
+                    # Allow horizontal margin around letter column
                     margin = int(w * 0.05)
                     col_left = t_xmin - margin
                     col_right = t_xmax + margin
 
                     matched_direction = None
 
-                    # Check candidate arrows
+                    # Find directional arrow aligned vertically below letter
                     for obj in detected_objects:
                         if obj['label'] in self.directions:
                             arr_cx, arr_cy = obj['center']
 
-                            # RULE 1: Arrow MUST be vertically below letter (arr_cy > t_cy)
-                            # RULE 2: Arrow center_x MUST be horizontally within letter column
+                            # RULE 1: Arrow MUST be below letter (arr_cy > t_cy)
+                            # RULE 2: Arrow MUST be horizontally within letter column margin
                             if arr_cy > t_cy and (col_left <= arr_cx <= col_right):
                                 matched_direction = obj['label']
-                                break  # Matched exact arrow below letter
+                                break
 
                     if matched_direction is not None:
                         action = f"TURN_{matched_direction.upper()}"
@@ -246,7 +256,6 @@ class ObjectRecognizer(Node):
                                     (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                         return action, debug_frame
                     else:
-                        # Display NOT FOUND if no arrow is strictly beneath target letter
                         cv2.putText(debug_frame, f"Target '{self.target_destination}' seen | Direction: NOT FOUND",
                                     (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
@@ -254,6 +263,21 @@ class ObjectRecognizer(Node):
             self.get_logger().error(f"Inference error: {e}")
 
         return None, debug_frame
+
+
+    def _parse_tflite_outputs(self):
+        """Helper function to parse SSD TFLite outputs."""
+        boxes, classes, scores = None, None, None
+        for detail in self.output_details:
+            tensor = np.squeeze(self.interpreter.get_tensor(detail['index']))
+            if tensor.ndim == 2 and tensor.shape[1] == 4:
+                boxes = tensor
+            elif tensor.ndim == 1 and tensor.size > 1:
+                if np.issubdtype(tensor.dtype, np.integer) or np.all(np.mod(tensor, 1) == 0):
+                    classes = tensor
+                else:
+                    scores = tensor
+        return boxes, classes, scores
 
 def main(args=None):
     rclpy.init(args=args)
