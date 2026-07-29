@@ -38,6 +38,17 @@ LANE_KI = 0.0
 LANE_KD = 0.3
 LANE_INTEGRAL_LIMIT = 1.0
 
+# Sharp-turn detection (used by edge_vectors_callback when only one lane
+# boundary is visible). A near-vertical single vector (steep slope) is a
+# normal lane boundary and is handled by the regular single-side PID bias.
+# A near-horizontal single vector (shallow slope) means the boundary has
+# swept across the image because of a sharp turn/intersection -- its "top"
+# endpoint is unreliable for left/right classification in that case, so we
+# switch to the dedicated sharp-turn maneuver below.
+SLOPE_ANGLE_NORMAL_DEG = 60.0   # >= this angle from horizontal -> normal single-side PID
+SLOPE_ANGLE_SHARP_DEG = 45.0    # < this angle from horizontal -> sharp-turn maneuver
+SHARP_TURN_MAGNITUDE = 0.8      # fixed turn command applied while executing the sharp turn
+
 # CONFIGURATION:
 # The buggy is driven in manual mode by publishing standard controller Joy messages to /cerebri/in/joy.
 # The layout is: msg.axes = [0.0, speed, 0.0, turn]
@@ -55,6 +66,16 @@ class LineFollower(Node):
     STATE_AWAITING_ZONE = 'AWAITING_ZONE'
     STATE_IN_ZONE = 'IN_ZONE'
     STATE_SIGN_TURNING = 'SIGN_TURNING'
+
+    # ------------------ Steering states (edge_vectors_callback) ------------------
+    # Normal PID lane-centering reuses STATE_EN_ROUTE above (2 vectors, or
+    # 1 vector with a steep slope). These two cover the sharp-turn maneuver:
+    # SHARP_WAITING -> 1 near-horizontal vector seen; driving straight until
+    #     its top and bottom points land on the same side of half_width.
+    # SHARP_TURNING -> committed to the turn; steering hard until both
+    #     vectors are visible again.
+    SHARP_WAITING = 'SHARP_WAITING'
+    SHARP_TURNING = 'SHARP_TURNING'
 
     # ------------------ LIDAR sectors (index range assuming a 360-sample scan; scaled otherwise) ------------------
     LEFT_SECTOR = (210, 330)    # building/zone check, left side
@@ -144,6 +165,12 @@ class LineFollower(Node):
         self._lane_prev_error = 0.0
         self._last_turn = 0.0
 
+        # Sharp-turn maneuver state (used by edge_vectors_callback).
+        # steer_state drives which steering strategy runs each frame -- see
+        # the state constants above for what each value means.
+        self.steer_state = self.STATE_EN_ROUTE
+        self.turn_dir = 0.0   # +1.0 (turn left) / -1.0 (turn right), latched for the current sharp turn
+
         # Mission state machine
         self.state = self.STATE_EN_ROUTE
 
@@ -204,9 +231,17 @@ class LineFollower(Node):
         Receives lane boundaries from the camera vector extractor and steers to
         keep the buggy centered between the left/right track edges.
 
+        Steering runs as a small state machine over self.steer_state:
+        - STATE_EN_ROUTE: normal PID lane-centering (see _steer_pid).
+        - SHARP_WAITING: one near-horizontal vector seen -- drive straight
+          until its top and bottom points land on the same side of half_width.
+        - SHARP_TURNING: committed to the turn -- steer hard until both
+          vectors are visible again.
+
         Uses the "top" (min-y / far) endpoint of each vector -- vector_X[0] --
-        rather than the bottom endpoint, so steering reacts slightly ahead of
-        the buggy's current position instead of only to what's directly beneath it.
+        rather than the bottom endpoint, so PID steering reacts slightly ahead
+        of the buggy's current position instead of only to what's directly
+        beneath it.
 
         IMPORTANT: vector_1 is NOT guaranteed to be the left boundary. The
         publisher only assigns vector_1/vector_2 in [left, right] order when
@@ -222,6 +257,48 @@ class LineFollower(Node):
         width = message.image_width
         half_width = width / 2.0
 
+        if message.vector_count >= 2:
+            self.steer_state = self.STATE_EN_ROUTE
+
+        elif message.vector_count == 1:
+            top_left = message.vector_1[0].x < half_width
+            bottom_left = message.vector_1[1].x < half_width
+
+            if self.steer_state == self.STATE_EN_ROUTE:
+                slope_deg = self._vector_slope_angle_deg(
+                    message.vector_1[0].x, message.vector_1[0].y,
+                    message.vector_1[1].x, message.vector_1[1].y)
+                if slope_deg < SLOPE_ANGLE_SHARP_DEG:
+                    # Near-horizontal -- use the BOTTOM point (the TOP point
+                    # is unreliable here) to latch which way to turn. Same
+                    # convention as the single-side PID bias below: a left
+                    # boundary biases us to turn right, a right boundary
+                    # biases us to turn left.
+                    self.turn_dir = -1.0 if bottom_left else 1.0
+                    # If top and bottom already agree on a side, the vector
+                    # isn't actually ambiguous -- commit to the turn right
+                    # away. Otherwise wait for them to agree before turning.
+                    self.steer_state = (
+                        self.SHARP_TURNING if top_left != bottom_left else self.SHARP_WAITING)
+                # slope_deg >= SLOPE_ANGLE_SHARP_DEG (includes the ambiguous
+                # 45-60 band) -- stay EN_ROUTE, normal single-side PID handles it.
+
+            elif self.steer_state == self.SHARP_WAITING and top_left != bottom_left:
+                self.steer_state = self.SHARP_TURNING
+
+            # SHARP_TURNING: nothing to update here -- only exits via vector_count >= 2 above.
+
+        if self.steer_state == self.STATE_EN_ROUTE:
+            turn = self._steer_pid(message, width, half_width)
+        elif self.steer_state == self.SHARP_WAITING:
+            turn = 0.0  # drive straight ahead until top/bottom agree on a side
+        else:  # SHARP_TURNING
+            turn = self.turn_dir * SHARP_TURN_MAGNITUDE
+
+        self.rover_move_manual_mode(self.target_speed, turn)
+
+    def _steer_pid(self, message, width, half_width):
+        """Normal lane-centering PID: midpoint of the visible boundary/boundaries."""
         left_x = None
         right_x = None
 
@@ -254,14 +331,26 @@ class LineFollower(Node):
             # No boundaries detected at all (e.g. momentary dropout) -- hold the
             # last computed steering instead of snapping back to straight, which
             # would fight whatever curve we were already navigating.
-            self.target_turn = self._last_turn
-            return
+            return self._last_turn
 
         # Normalize to roughly [-1, 1]. Positive error = track center is to the
         # LEFT of image center -> steer left (positive turn), matching the Joy
         # convention (axes[3] positive = left steer).
         error = (half_width - midpoint) / half_width
-        self.target_turn = self._update_lane_pid(error)
+        return self._update_lane_pid(error)
+
+    def _vector_slope_angle_deg(self, x0, y0, x1, y1):
+        """
+        Returns the angle (0-90 degrees) that the vector from (x0, y0) to
+        (x1, y1) makes with the horizontal. 90 degrees = perfectly vertical
+        (a normal-looking lane boundary); 0 degrees = perfectly horizontal
+        (the near-horizontal boundary seen during a sharp turn/intersection).
+        """
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        if dx == 0 and dy == 0:
+            return 90.0
+        return math.degrees(math.atan2(dy, dx))
 
     def _update_lane_pid(self, error):
         """PID step for lane centering. Returns a turn command clamped to [TURN_MIN, TURN_MAX]."""
