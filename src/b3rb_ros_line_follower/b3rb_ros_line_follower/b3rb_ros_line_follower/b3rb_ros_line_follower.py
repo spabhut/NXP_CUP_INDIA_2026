@@ -30,7 +30,7 @@ TURN_MIN = -1.0
 TURN_MAX = 1.0
 
 # Speeds & Turn Rates
-LANE_SPEED = 0.75
+LANE_SPEED = 0.5
 AWAIT_SPEED = 0.5
 TURN_SPEED = 0.5
 TURN_OMEGA = 0.8
@@ -216,14 +216,16 @@ class LineFollower(Node):
         if num_readings == 0:
             return False
             
-        idx_90, _ = self._scale_indices(num_readings, 85, 95)
-        idx_270, _ = self._scale_indices(num_readings, 265, 275)
+        start_90, end_90 = self._scale_indices(num_readings, 85, 95)
+        start_270, end_270 = self._scale_indices(num_readings, 265, 275)
         
-        val_90 = self.latest_ranges[idx_90] if idx_90 < num_readings else float('inf')
-        val_270 = self.latest_ranges[idx_270] if idx_270 < num_readings else float('inf')
+        sector_90 = self.latest_ranges[start_90:end_90]
+        sector_270 = self.latest_ranges[start_270:end_270]
         
-        return (math.isfinite(val_90) and val_90 < POLE_DIST_THRESHOLD) or \
-               (math.isfinite(val_270) and val_270 < POLE_DIST_THRESHOLD)
+        pole_90_detected = any(math.isfinite(r) and r < POLE_DIST_THRESHOLD for r in sector_90)
+        pole_270_detected = any(math.isfinite(r) and r < POLE_DIST_THRESHOLD for r in sector_270)
+        
+        return pole_90_detected and pole_270_detected
 
     # ------------------ Callback Implementations ------------------
 

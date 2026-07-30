@@ -274,7 +274,7 @@
 
 
 	<!-- Hospital 1 Parking Lot Cones -->
-	<!--
+	
 	<include>
 		<uri>models://Construction_Cone_mini</uri>
 		<name>h1_c1</name>
@@ -350,11 +350,11 @@
 		<name>h1_c15</name>
 		<pose>3.454960 -9.047330 0 0 0 0</pose>
 	</include>
-	-->
+	
 
 
 	<!-- Hospital 2 Parking Lot Cones -->
-	<!--
+	
 	<include>
 		<uri>models://Construction_Cone_mini</uri>
 		<name>h2_c1</name>
@@ -430,11 +430,11 @@
 		<name>h2_c15</name>
 		<pose>-5.450730 6.595300 0 0 0 0</pose>
 	</include>
-	-->
+	
 
 
 	<!-- Hospital 3 Parking Lot Cones -->
-	<!--
+	
 	<include>
 		<uri>models://Construction_Cone_mini</uri>
 		<name>h3_c1</name>
@@ -510,13 +510,13 @@
 		<name>h3_c15</name>
 		<pose>15.0814 12.1138 0 0 0 0</pose>
 	</include>
-	-->
+	
 
 
 
 	<!-- Obstacles -->
-	<!--
-	<include>
+	
+	<!-- <include>
 		<uri>models://barricade</uri>
 		<name>barricade_1</name>
 		<pose>12.79 24.5135 0.149 0 0 -0.3</pose>
@@ -629,8 +629,8 @@
 		<uri>models://lamp_post</uri>
 		<name>lamp_3</name>
 		<pose>-1.3122 -2.5313 0 0 0 -3.0000</pose>
-	</include>
-	-->
+	</include> -->
+	
 
 	
 	<!-- Below objects are the ones not on the track. You can set the coordinates to place them on track -->
