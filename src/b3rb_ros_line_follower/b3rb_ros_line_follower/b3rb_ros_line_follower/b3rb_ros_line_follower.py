@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from email.mime import message
+
 import rclpy
 from rclpy.node import Node
 import math
@@ -30,7 +32,7 @@ TURN_MIN = -1.0
 TURN_MAX = 1.0
 
 # Speeds & Turn Rates
-LANE_SPEED = 0.5
+LANE_SPEED = 1.0
 AWAIT_SPEED = 0.5
 TURN_SPEED = 0.5
 TURN_OMEGA = 0.8
@@ -146,6 +148,11 @@ class LineFollower(Node):
         self.target_speed = LANE_SPEED
         self.target_turn = 0.0
         self.teleop_active = False  
+        
+        # ------------------ Obstacle Avoidance Variables ------------------
+        self.obstacle_active = False
+        self.avoidance_side = None
+        self._prev_obstacle_active = False
 
         self._lane_integral = 0.0
         self._lane_prev_error = 0.0
@@ -181,6 +188,10 @@ class LineFollower(Node):
             self.get_logger().info(f"[STATE UPDATE] Mission: {self.state} | Lane: {self.lane_state}")
             self._prev_state = self.state
             self._prev_lane_state = self.lane_state
+            
+        if self.obstacle_active != self._prev_obstacle_active:
+            self.get_logger().info(f"[OBSTACLE AVOIDANCE] Active: {self.obstacle_active} | Hugging Side: {self.avoidance_side}")
+            self._prev_obstacle_active = self.obstacle_active
 
         if self.teleop_active:
             return
@@ -233,12 +244,18 @@ class LineFollower(Node):
         # 1. Mission Override: If we scanned a QR and are heading to the zone, ignore lane PID and drive straight
         if self.state == self.STATE_IN_ZONE:
             return
-        if self.state == self.STATE_AWAITING_ZONE:
-            self.rover_move_manual_mode(AWAIT_SPEED, 0.0)
-            return
 
         width = message.image_width
         half_width = width / 2.0
+                
+        # ------------------ TOP MOST PRIORITY INTERRUPT: Obstacle Avoidance ------------------
+        if self.obstacle_active and self.avoidance_side is not None:
+            # Force the buggy to hug the designated safe side
+            turn = self._steer_pid_side(message, width, half_width, self.avoidance_side)
+            OBSTACLE_SPEED = 0.2
+            self.rover_move_manual_mode(OBSTACLE_SPEED, turn)
+            return
+        # -------------------------------------------------------------------------------------
 
         # 2. Maneuver State Machine Logic
         if self.lane_state == self.STATE_SIGN_WAITING:
@@ -262,8 +279,11 @@ class LineFollower(Node):
                 self.lane_state = self.STATE_LANE
 
             elif message.vector_count == 1:
-                top_left = message.vector_1[0].x < half_width
-                bottom_left = message.vector_1[1].x < half_width
+                top_x = message.vector_1[0].x
+                bottom_x = message.vector_1[1].x
+                
+                top_left = top_x < half_width
+                bottom_left = bottom_x < half_width
 
                 if self.lane_state == self.STATE_LANE:
                     # Check if this single boundary indicates a sharp turn or not.
@@ -271,18 +291,12 @@ class LineFollower(Node):
                         message.vector_1[0].x, message.vector_1[0].y,
                         message.vector_1[1].x, message.vector_1[1].y)
                     if slope_deg < SLOPE_ANGLE_SHARP_DEG:
-                        # Near-horizontal -- use the BOTTOM point (the TOP point
-                        # is unreliable here) to latch which way to turn. Same
-                        # convention as the single-side PID bias below: a left
-                        # boundary biases us to turn right, a right boundary
-                        # biases us to turn left.
-                        self.turn_dir = -1.0 if bottom_left else 1.0
+                        # FIXED: Direction is based on where the top of the line points relative to the bottom
+                        self.turn_dir = 1.0 if (top_x < bottom_x) else -1.0
+                        
                         self.lane_state = (
                             self.STATE_SHARP_WAITING if top_left == bottom_left
                             else self.STATE_SHARP_TURNING)
-                    # slope_deg >= SLOPE_ANGLE_SHARP_DEG (includes the ambiguous
-                    # 45-60 band) -- not a sharp turn, stay STATE_LANE, normal
-                    # single-side PID handles it.
 
                 elif self.lane_state == self.STATE_SHARP_WAITING and top_left != bottom_left:
                     self.lane_state = self.STATE_SHARP_TURNING
@@ -344,46 +358,45 @@ class LineFollower(Node):
         return self._update_lane_pid(error)
 
     def _steer_pid_side(self, message, width, half_width, side):
-        """Side-specific lane-following PID for intersections. 
-        Stays 0.75m distance away from the specific vector line.
-        Uses the bottom point of the vector [1] to avoid cross-street interference."""
+        """Corrected side-specific lane-following PID."""
         left_x = None
         right_x = None
 
+        # Safely assign vectors without blind overwriting
+        vectors_x = []
         if message.vector_count >= 1:
-            # Anchoring to bottom point using [1] instead of [0] to ignore the horizontal cross-street at the top of the frame.
-            x = message.vector_1[1].x
-            if x < half_width:
-                left_x = x
-            else:
-                right_x = x
-
+            vectors_x.append(message.vector_1[1].x)
         if message.vector_count >= 2:
-            # Anchoring to bottom point using [1] instead of [0] to ignore the horizontal cross-street at the top of the frame.
-            x = message.vector_2[1].x
-            if x < half_width:
-                left_x = x
-            else:
-                right_x = x
+            vectors_x.append(message.vector_2[1].x)
 
-        # Set specific track distance away from line
+        for x in vectors_x:
+            if x < half_width:
+                # Keep the leftmost line for left_x
+                if left_x is None or x < left_x:
+                    left_x = x
+            else:
+                # Keep the rightmost line for right_x
+                if right_x is None or x > right_x:
+                    right_x = x
+
         offset = 0.75 * half_width 
 
-        # We MUST stick to the designated side. If that side's line is missing 
-        # (e.g. went off screen during a sharp turn), force a hard steer in that 
-        # direction to find it again. NEVER fall back to tracking the opposite line!
         if side == 'LEFT':
             if left_x is not None:
-                midpoint = left_x + offset
+                # INVERTED: To hug left, force the left line to the right side of the screen
+                midpoint = left_x - offset 
                 error = (half_width - midpoint) / half_width
             else:
-                error = 1.0  # Steer HARD left to reacquire the corner line
+                error = 1.0  # Steer HARD left
+                
         elif side == 'RIGHT':
             if right_x is not None:
-                midpoint = right_x - offset
+                # INVERTED: To hug right, force the right line to the left side of the screen
+                midpoint = right_x + offset 
                 error = (half_width - midpoint) / half_width
             else:
-                error = -1.0 # Steer HARD right to reacquire the corner line
+                error = -1.0 # Steer HARD right
+                
         else:
             return self._last_turn
 
@@ -413,6 +426,57 @@ class LineFollower(Node):
         if num_readings == 0:
             return
 
+        # ------------------ Obstacle Avoidance Logic ------------------
+        # The Buggy's physical orientation maps 180 degrees to dead ahead.
+        # Front sectors (detection threshold = 0.8m)
+        front_center = self._sector_occupancy_ratio(ranges, num_readings, 165, 195, 1.2)
+        front_right  = self._sector_occupancy_ratio(ranges, num_readings, 150, 180, 1.2)
+        front_left   = self._sector_occupancy_ratio(ranges, num_readings, 180, 210, 1.2)
+        
+        # Wide Side regions to detect clearance (threshold = 1.0m)
+        side_right = self._sector_occupancy_ratio(ranges, num_readings, 60, 120, 1.0)
+        side_left  = self._sector_occupancy_ratio(ranges, num_readings, 240, 300, 1.0)
+                
+        if not self.obstacle_active:
+            # CASE 1: Object Dead Ahead (Blocking the center)
+            if front_center >= 0.2:
+                self.obstacle_active = True
+                # Dynamically choose the path of least resistance
+                if front_left < front_right:
+                    self.avoidance_side = 'LEFT'
+                else:
+                    self.avoidance_side = 'RIGHT'
+                    
+                # ADDED DEBUG LOG:
+                self.get_logger().info(f"[OBSTACLE DEBUG] Obstacle detected in CENTER. Chose to avoid by hugging {self.avoidance_side}.")
+                    
+            # CASE 2: Object predominantly on the right
+            elif front_right >= 0.3:
+                self.obstacle_active = True
+                self.avoidance_side = 'LEFT'  # Hug the left line
+                
+                # ADDED DEBUG LOG:
+                self.get_logger().info("[OBSTACLE DEBUG] Obstacle detected on RIGHT. Chose to avoid by hugging LEFT.")
+                
+            # CASE 3: Object predominantly on the left
+            elif front_left >= 0.3:
+                self.obstacle_active = True
+                self.avoidance_side = 'RIGHT' # Hug the right line
+                
+                # ADDED DEBUG LOG:
+                self.get_logger().info("[OBSTACLE DEBUG] Obstacle detected on LEFT. Chose to avoid by hugging RIGHT.")
+
+        else:
+            # RESET CONDITION: Only disable avoidance when the front is completely clear 
+            # (less than 10% occupied) AND the obstacle has passed into our side views.
+            front_clear = (front_center < 0.1) and (front_right < 0.1) and (front_left < 0.1)
+            obstacle_passed = (side_right > 0.0) or (side_left > 0.0)
+            
+            if front_clear and obstacle_passed:
+                self.obstacle_active = False
+                self.avoidance_side = None
+
+        # ------------------ Existing Zone Logic ------------------
         if self.state == self.STATE_AWAITING_ZONE:
             left_ratio = self._sector_occupancy_ratio(
                 ranges, num_readings, *self.LEFT_SECTOR, threshold=self.BUILDING_DIST_THRESHOLD)
