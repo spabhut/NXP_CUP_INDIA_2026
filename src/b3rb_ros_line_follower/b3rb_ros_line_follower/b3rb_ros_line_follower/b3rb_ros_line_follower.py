@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from email.mime import message
+
 import rclpy
 from rclpy.node import Node
 import math
@@ -29,42 +31,61 @@ SPEED_MAX = 1.0
 TURN_MIN = -1.0
 TURN_MAX = 1.0
 
-# CONFIGURATION:
-# The buggy is driven in manual mode by publishing standard controller Joy messages to /cerebri/in/joy.
-# The layout is: msg.axes = [0.0, speed, 0.0, turn]
-# - speed: positive for forward, negative for reverse. Range: [-1.0, 1.0]
-# - turn: positive for left steer, negative for right steer. Range: [-1.0, 1.0]
-# msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1] (Keep buttons set to this pattern for manual override mode)
+# Speeds & Turn Rates
+LANE_SPEED = 1.0
+AWAIT_SPEED = 0.5
+TURN_SPEED = 0.5
+TURN_OMEGA = 0.8
+POLE_DIST_THRESHOLD = 1.5
+
+# Lane-following PID gains.
+LANE_KP = 1.2
+LANE_KI = 0.0
+LANE_KD = 0.3
+LANE_INTEGRAL_LIMIT = 1.0
+
+# Sharp-turn detection thresholds
+SLOPE_ANGLE_NORMAL_DEG = 60.0   
+SLOPE_ANGLE_SHARP_DEG = 45.0    
+
+# Sign-board turn maneuver constants
+SIGN_LEFT = 'TURN_LEFT'
+SIGN_RIGHT = 'TURN_RIGHT'
+SIGN_STRAIGHT = 'TURN_STRAIGHT'
 
 class LineFollower(Node):
     """
     Core controller Node for the B3RB buggy.
     """
 
-    # ------------------ Mission states ------------------
+    # ------------------ Mission states (self.state) ------------------
     STATE_EN_ROUTE = 'EN_ROUTE'
     STATE_AWAITING_ZONE = 'AWAITING_ZONE'
     STATE_IN_ZONE = 'IN_ZONE'
-    STATE_SIGN_TURNING = 'SIGN_TURNING'
 
-    # ------------------ LIDAR sectors (index range assuming a 360-sample scan; scaled otherwise) ------------------
-    LEFT_SECTOR = (210, 330)    # building/zone check, left side
-    RIGHT_SECTOR = (30, 150)    # building/zone check, right side
+    # ------------------ Lane states (self.lane_state) ------------------
+    STATE_LANE = 'LANE'                   
+    STATE_SHARP_WAITING = 'SHARP_WAITING' 
+    STATE_SHARP_TURNING = 'SHARP_TURNING' 
+    STATE_SIGN_WAITING = 'SIGN_WAITING'   
+    STATE_SIGN_TURNING = 'SIGN_TURNING'   
+
+    # ------------------ LIDAR sectors ------------------
+    LEFT_SECTOR = (210, 330)    
+    RIGHT_SECTOR = (30, 150)    
 
     # ------------------ Thresholds ------------------
-    BUILDING_DIST_THRESHOLD = 2      # meters -- "close" for zone purposes
-    BUILDING_OCCUPANCY_RATIO = 0.75     # fraction of a side sector that must be "close" to call it a building
+    BUILDING_DIST_THRESHOLD = 2      
+    BUILDING_OCCUPANCY_RATIO = 0.75     
 
-    DEFAULT_SPEED = 0.5
-
-    # ------------------ Destination name -> sign-board letter (per FAQ7) ------------------
-    DESTINATION_TO_SIGN = {
-        'PATIENT_1': 'A',
-        'PATIENT_2': 'B',
-        'PATIENT_3': 'C',
-        'HOSPITAL_1': 'X',
-        'HOSPITAL_2': 'Y',
-        'HOSPITAL_3': 'Z',
+    # ------------------ Sign-board letter -> Destination name ------------------
+    SIGN_TO_DESTINATION = {
+        'A': 'PATIENT_1',
+        'B': 'PATIENT_2',
+        'C': 'PATIENT_3',
+        'X': 'HOSPITAL_1',
+        'Y': 'HOSPITAL_2',
+        'Z': 'HOSPITAL_3',
     }
 
     def __init__(self):
@@ -101,8 +122,6 @@ class LineFollower(Node):
             self.sign_board_callback,
             QOS_PROFILE_DEFAULT)
 
-        # Teleop override: when True, a human is driving via keyboard teleop, so this
-        # node must NOT publish its own drive commands.
         self.subscription_teleop_override = self.create_subscription(
             Bool,
             '/teleop/override',
@@ -126,25 +145,37 @@ class LineFollower(Node):
             QOS_PROFILE_DEFAULT)
 
         # ------------------ State Variables & Timer ------------------
-        self.target_speed = self.DEFAULT_SPEED
+        self.target_speed = LANE_SPEED
         self.target_turn = 0.0
-        self.teleop_active = False
+        self.teleop_active = False  
+        
+        # ------------------ Obstacle Avoidance Variables ------------------
+        self.obstacle_active = False
+        self.avoidance_side = None
+        self._prev_obstacle_active = False
 
-        # Mission state machine
+        self._lane_integral = 0.0
+        self._lane_prev_error = 0.0
+        self._last_turn = 0.0
+
+        self.lane_state = self.STATE_LANE
+        self.turn_dir = 0.0   
+
         self.state = self.STATE_EN_ROUTE
 
-        # Mission target / QR tracking
-        self.current_destination = "PATIENT_1"   # set by server instructions, e.g. "PATIENT_1"
+        self.current_destination = "A"   
         self.pending_qr_loc = None
         self.mission_completed = False
+        
+        self._prev_state = self.state
+        self._prev_lane_state = self.lane_state
 
-        # Server comms tracking
-        self.own_uid = 0              # rolling uid (0-255) for messages *we* originate
-        self.awaiting_ack_uid = None  # uid of our own outgoing message we're still waiting to be ack'd
+        self.own_uid = 0              
+        self.awaiting_ack_uid = None  
 
-        # Sign-board turn tracking: latched direction for the current STATE_SIGN_TURNING
-        # episode (reset / actual turn maneuver TBD later).
         self.latched_sign_direction = None
+        self.latest_ranges = []
+        self.pole_timer_start = None
 
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
         self.publish_target_destination(self.current_destination)
@@ -153,19 +184,24 @@ class LineFollower(Node):
 
     # ------------------ Drive helpers ------------------
     def publish_drive_commands(self):
-        """Timer callback that periodically publishes the current speed and steer command."""
+        if self.state != self._prev_state or self.lane_state != self._prev_lane_state:
+            self.get_logger().info(f"[STATE UPDATE] Mission: {self.state} | Lane: {self.lane_state}")
+            self._prev_state = self.state
+            self._prev_lane_state = self.lane_state
+            
+        if self.obstacle_active != self._prev_obstacle_active:
+            self.get_logger().info(f"[OBSTACLE AVOIDANCE] Active: {self.obstacle_active} | Hugging Side: {self.avoidance_side}")
+            self._prev_obstacle_active = self.obstacle_active
+
         if self.teleop_active:
-            # A human is driving via keyboard teleop right now -- stay quiet
-            # so we don't fight teleop for control of /cerebri/in/joy.
             return
 
         msg = Joy()
-        msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]  # Manual override button configuration
+        msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]  
         msg.axes = [0.0, self.target_speed, 0.0, self.target_turn]
         self.publisher_joy.publish(msg)
 
     def rover_move_manual_mode(self, speed, turn):
-        """Helper to immediately set control speed and steering angle."""
         self.target_speed = float(max(min(speed, SPEED_MAX), -SPEED_MAX))
         self.target_turn = float(max(min(turn, TURN_MAX), -TURN_MAX))
 
@@ -182,43 +218,277 @@ class LineFollower(Node):
             return 0.0
         close_count = sum(1 for r in sector if math.isfinite(r) and r < threshold)
         return close_count / len(sector)
+        
+    def _check_poles(self):
+        if not self.latest_ranges:
+            return False
+        
+        num_readings = len(self.latest_ranges)
+        if num_readings == 0:
+            return False
+            
+        start_90, end_90 = self._scale_indices(num_readings, 85, 95)
+        start_270, end_270 = self._scale_indices(num_readings, 265, 275)
+        
+        sector_90 = self.latest_ranges[start_90:end_90]
+        sector_270 = self.latest_ranges[start_270:end_270]
+        
+        pole_90_detected = any(math.isfinite(r) and r < POLE_DIST_THRESHOLD for r in sector_90)
+        pole_270_detected = any(math.isfinite(r) and r < POLE_DIST_THRESHOLD for r in sector_270)
+        
+        return pole_90_detected and pole_270_detected
 
     # ------------------ Callback Implementations ------------------
 
     def edge_vectors_callback(self, message):
-        """
-        Receives lane boundaries from the camera vector extractor.
-        
-        GUIDELINE (Lane Following):
-        - `message.vector_count` contains the number of active bounds seen (0, 1, or 2).
-        - `message.vector_1` and `message.vector_2` contain the points defining the bounds.
-        - You need to write logic to compute the centerline deviation and adjust `self.target_turn`.
-        - E.g., if only one line is seen, steer away from it to keep distance; if two lines are seen,
-          calculate the midpoint relative to the image width and steer to center the buggy.
-        """
-        # HINTS:
-        # width = message.image_width
-        # half_width = width / 2.0
-        # For now, we do not modify self.target_turn so the buggy continues straight.
-        pass
+        # 1. Mission Override: If we scanned a QR and are heading to the zone, ignore lane PID and drive straight
+        if self.state == self.STATE_IN_ZONE:
+            return
+
+        width = message.image_width
+        half_width = width / 2.0
+                
+        # ------------------ TOP MOST PRIORITY INTERRUPT: Obstacle Avoidance ------------------
+        if self.obstacle_active and self.avoidance_side is not None:
+            # Force the buggy to hug the designated safe side
+            turn = self._steer_pid_side(message, width, half_width, self.avoidance_side)
+            OBSTACLE_SPEED = 0.2
+            self.rover_move_manual_mode(OBSTACLE_SPEED, turn)
+            return
+        # -------------------------------------------------------------------------------------
+
+        # 2. Maneuver State Machine Logic
+        if self.lane_state == self.STATE_SIGN_WAITING:
+            if self._check_poles():
+                self.get_logger().info("Poles detected, starting sign turn maneuver.")
+                self.lane_state = self.STATE_SIGN_TURNING
+                self.pole_timer_start = self.get_clock().now()
+
+        elif self.lane_state == self.STATE_SIGN_TURNING:
+            elapsed = 0.0
+            if self.pole_timer_start is not None:
+                elapsed = (self.get_clock().now() - self.pole_timer_start).nanoseconds / 1e9
+            
+            # Cooldown of 0.5 seconds prevents triggering on the entrance poles immediately 
+            if elapsed > 2.0 and self._check_poles():
+                self.get_logger().info("Cross poles detected, returning to lane.")
+                self.lane_state = self.STATE_LANE
+
+        else:
+            if message.vector_count >= 2:
+                self.lane_state = self.STATE_LANE
+
+            elif message.vector_count == 1:
+                top_x = message.vector_1[0].x
+                bottom_x = message.vector_1[1].x
+                
+                top_left = top_x < half_width
+                bottom_left = bottom_x < half_width
+
+                if self.lane_state == self.STATE_LANE:
+                    # Check if this single boundary indicates a sharp turn or not.
+                    slope_deg = self._vector_slope_angle_deg(
+                        message.vector_1[0].x, message.vector_1[0].y,
+                        message.vector_1[1].x, message.vector_1[1].y)
+                    if slope_deg < SLOPE_ANGLE_SHARP_DEG:
+                        # FIXED: Direction is based on where the top of the line points relative to the bottom
+                        self.turn_dir = 1.0 if (top_x < bottom_x) else -1.0
+                        
+                        self.lane_state = (
+                            self.STATE_SHARP_WAITING if top_left == bottom_left
+                            else self.STATE_SHARP_TURNING)
+
+                elif self.lane_state == self.STATE_SHARP_WAITING and top_left != bottom_left:
+                    self.lane_state = self.STATE_SHARP_TURNING
+
+        # 3. Apply Steering and Speed based on Final State
+        if self.lane_state == self.STATE_LANE:
+            self.target_speed = LANE_SPEED
+            turn = self._steer_pid(message, width, half_width)
+            
+        elif self.lane_state == self.STATE_SHARP_WAITING:
+            turn = 0.0  
+            self.target_speed = AWAIT_SPEED
+            
+        elif self.lane_state == self.STATE_SHARP_TURNING:
+            turn = self.turn_dir * TURN_OMEGA
+            self.target_speed = TURN_SPEED
+            
+        elif self.lane_state == self.STATE_SIGN_WAITING:
+            turn = 0.0  
+            self.target_speed = AWAIT_SPEED
+            
+        elif self.lane_state == self.STATE_SIGN_TURNING:
+            # We only arrive in this state for LEFT or RIGHT turns, STRAIGHT is bypassed above
+            side = 'LEFT' if self.latched_sign_direction == SIGN_LEFT else 'RIGHT'
+            turn = self._steer_pid_side(message, width, half_width, side)
+            self.target_speed = TURN_SPEED
+
+        self.rover_move_manual_mode(self.target_speed, turn)
+
+    def _steer_pid(self, message, width, half_width):
+        """Normal lane-centering PID: midpoint of the visible boundary/boundaries."""
+        left_x = None
+        right_x = None
+
+        if message.vector_count >= 1:
+            x = message.vector_1[0].x
+            if x < half_width:
+                left_x = x
+            else:
+                right_x = x
+
+        if message.vector_count >= 2:
+            x = message.vector_2[0].x
+            if x < half_width:
+                left_x = x
+            else:
+                right_x = x
+
+        if left_x is not None and right_x is not None:
+            midpoint = (left_x + right_x) / 2.0
+        elif left_x is not None:
+            midpoint = (left_x + width) / 2.0
+        elif right_x is not None:
+            midpoint = right_x / 2.0
+        else:
+            return self._last_turn
+
+        error = (half_width - midpoint) / half_width
+        return self._update_lane_pid(error)
+
+    def _steer_pid_side(self, message, width, half_width, side):
+        """Corrected side-specific lane-following PID."""
+        left_x = None
+        right_x = None
+
+        # Safely assign vectors without blind overwriting
+        vectors_x = []
+        if message.vector_count >= 1:
+            vectors_x.append(message.vector_1[1].x)
+        if message.vector_count >= 2:
+            vectors_x.append(message.vector_2[1].x)
+
+        for x in vectors_x:
+            if x < half_width:
+                # Keep the leftmost line for left_x
+                if left_x is None or x < left_x:
+                    left_x = x
+            else:
+                # Keep the rightmost line for right_x
+                if right_x is None or x > right_x:
+                    right_x = x
+
+        offset = 0.75 * half_width 
+
+        if side == 'LEFT':
+            if left_x is not None:
+                # INVERTED: To hug left, force the left line to the right side of the screen
+                midpoint = left_x - offset 
+                error = (half_width - midpoint) / half_width
+            else:
+                error = 1.0  # Steer HARD left
+                
+        elif side == 'RIGHT':
+            if right_x is not None:
+                # INVERTED: To hug right, force the right line to the left side of the screen
+                midpoint = right_x + offset 
+                error = (half_width - midpoint) / half_width
+            else:
+                error = -1.0 # Steer HARD right
+                
+        else:
+            return self._last_turn
+
+        return self._update_lane_pid(error)
+
+    def _vector_slope_angle_deg(self, x0, y0, x1, y1):
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        if dx == 0 and dy == 0:
+            return 90.0
+        return math.degrees(math.atan2(dy, dx))
+
+    def _update_lane_pid(self, error):
+        """PID step for lane centering. Returns a turn command clamped to [TURN_MIN, TURN_MAX]."""
+        self._lane_integral = max(min(self._lane_integral + error, LANE_INTEGRAL_LIMIT), -LANE_INTEGRAL_LIMIT)
+        derivative = error - self._lane_prev_error
+        self._lane_prev_error = error
+
+        turn = (LANE_KP * error) + (LANE_KI * self._lane_integral) + (LANE_KD * derivative)
+        self._last_turn = turn
+        return turn
 
     def lidar_callback(self, message):
-        """
-        Receives LIDAR range measurements.
-        
-        GUIDELINE (Obstacle Avoidance & Building Range):
-        - `message.ranges` is an array of distances in meters around the buggy.
-        - The laser scans cover 360 degrees. Find which indices correspond to the front of the buggy.
-        - If a range value in the front sector is below a threshold (e.g. 0.8m), flag an obstacle.
-        - Write obstacle avoidance maneuvers (e.g. stop, steer left/right around the block, and merge back).
-        - Use LIDAR side-ranges to verify distance to building/QR signs before patient pickup/hospital drop actions.
-        """
+        self.latest_ranges = message.ranges
         ranges = message.ranges
         num_readings = len(ranges)
         if num_readings == 0:
             return
 
-        # --- Zone detection only matters once a matching QR has been seen ---
+        # ------------------ Obstacle Avoidance Logic ------------------
+        # The Buggy's physical orientation maps 180 degrees to dead ahead.
+        # Front sectors (detection threshold = 0.8m)
+        base_center = 180
+
+        # Offset the LIDAR frame of reference ONLY when avoiding an obstacle
+        if self.obstacle_active:
+            # Map the current steering command (-1.0 to 1.0) to a degree shift. 
+            # Negative turn (Right) shifts sectors Left (+) to stay aligned with the road.
+            MAX_OFFSET_DEG = -40  # You can tune this maximum degree offset if needed
+            offset = int(-self.target_turn * MAX_OFFSET_DEG)
+            base_center += offset
+
+        # Front sectors (detection threshold = 0.6m) dynamically shifted
+        front_center = self._sector_occupancy_ratio(ranges, num_readings, base_center - 10, base_center + 10, 1.2)
+        front_right  = self._sector_occupancy_ratio(ranges, num_readings, base_center - 20, base_center , 1.2)
+        front_left   = self._sector_occupancy_ratio(ranges, num_readings, base_center, base_center + 20, 1.2)
+        front_left_check = self._sector_occupancy_ratio(ranges, num_readings, base_center + 30, base_center + 140, 1.2)
+        front_right_check = self._sector_occupancy_ratio(ranges, num_readings, base_center - 140, base_center - 30, 1.2)
+        # Wide Side regions to detect clearance (threshold = 1.0m) dynamically shifted
+        side_right = self._sector_occupancy_ratio(ranges, num_readings, base_center - 120, base_center - 60, 1.0)
+        side_left  = self._sector_occupancy_ratio(ranges, num_readings, base_center + 60, base_center + 120, 1.0)
+                
+        if not self.obstacle_active:
+            # CASE 1: Object Dead Ahead (Blocking the center)
+            if front_center >= 0.7:
+                self.obstacle_active = True
+                # Dynamically choose the path of least resistance
+                if front_left < front_right:
+                    self.avoidance_side = 'LEFT'
+                elif front_right < front_left:
+                    self.avoidance_side = 'RIGHT'
+                    
+                # ADDED DEBUG LOG:
+                self.get_logger().info(f"[OBSTACLE DEBUG] Obstacle detected in CENTER. Chose to avoid by hugging {self.avoidance_side}.")
+                    
+            # CASE 2: Object predominantly on the right
+            elif front_right >= 0.2:
+                self.obstacle_active = True
+                self.avoidance_side = 'LEFT'  # Hug the left line
+                
+                # ADDED DEBUG LOG:
+                self.get_logger().info("[OBSTACLE DEBUG] Obstacle detected on RIGHT. Chose to avoid by hugging LEFT.")
+                
+            # CASE 3: Object predominantly on the left
+            elif front_left >= 0.2:
+                self.obstacle_active = True
+                self.avoidance_side = 'RIGHT' # Hug the right line
+                
+                # ADDED DEBUG LOG:
+                self.get_logger().info("[OBSTACLE DEBUG] Obstacle detected on LEFT. Chose to avoid by hugging RIGHT.")
+
+        else:
+            # RESET CONDITION: Only disable avoidance when the front is completely clear 
+            # (less than 10% occupied) AND the obstacle has passed into our side views.
+            front_clear = (front_center < 0.5) and (front_right < 0.5) and (front_left < 0.5)
+            obstacle_passed = (front_left_check < 0.5) and (front_right_check < 0.5)
+            
+            if front_clear and obstacle_passed:
+                self.obstacle_active = False
+                self.avoidance_side = None
+
+        # ------------------ Existing Zone Logic ------------------
         if self.state == self.STATE_AWAITING_ZONE:
             left_ratio = self._sector_occupancy_ratio(
                 ranges, num_readings, *self.LEFT_SECTOR, threshold=self.BUILDING_DIST_THRESHOLD)
@@ -236,16 +506,6 @@ class LineFollower(Node):
         self.send_server_update(self.pending_qr_loc)
 
     def server_communication_callback(self, message):
-        """
-        Receives coordination commands from the server.
-        
-        GUIDELINE (Server Communication):
-        - Check if the message is destined for the Buggy (`message.dest == 1`).
-		- Do not forget to check for ACK messages from server
-        - The server communicates mission info in the `message.msg` payload string.
-        - Parse server instructions (e.g., patient pickup, target hospitals).
-        - Call `self.send_server_update` to report your status when you reach a checkpoint.
-        """
         if message.dest != 1:
             return
 
@@ -271,28 +531,19 @@ class LineFollower(Node):
 
             self.pending_qr_loc = None
             self.state = self.STATE_EN_ROUTE
-            self.target_speed = self.DEFAULT_SPEED
+            self.target_speed = LANE_SPEED
 
-    def publish_target_destination(self, destination_name):
-        """Maps a destination name (e.g. 'PATIENT_1', 'HOSPITAL_2') to its sign-board
-        letter (per FAQ7) and publishes it to /target_destination for the object
-        recognizer node to watch for."""
-        sign_letter = self.DESTINATION_TO_SIGN.get(destination_name)
-        if sign_letter is None:
-            self.get_logger().warn(
-                f"No sign-letter mapping for destination '{destination_name}' -- not publishing target.")
-            return
-
+    def publish_target_destination(self, target_sign):
+        """Publishes the target sign-board letter (e.g. 'A', 'X') for the object recognizer."""
         msg = String()
-        msg.data = sign_letter
+        msg.data = target_sign
         self.publisher_target_destination.publish(msg)
-        self.get_logger().info(f"Published target_destination: '{sign_letter}' (for {destination_name})")
+        self.get_logger().info(f"Published target_destination: '{target_sign}'")
 
     def send_server_update(self, text_msg):
-        """Sends status messages to the server. (Do not forget to send ACK messages to server)"""
         server_msg = ServerCommunication()
-        server_msg.src = 1       # Source component: Buggy-1
-        server_msg.dest = 2      # Destination component: Server-2
+        server_msg.src = 1       
+        server_msg.dest = 2      
         server_msg.uid = self.own_uid
         server_msg.ack = 0
         server_msg.msg = text_msg
@@ -304,10 +555,6 @@ class LineFollower(Node):
         self.own_uid = (self.own_uid + 1) % 256
 
     def _send_ack(self, uid):
-        """
-        Sends a bare acknowledgment back to the server for a message it sent us.
-        Echoes the server's own uid (not our rolling counter) with ack=1, msg="".
-        """
         server_msg = ServerCommunication()
         server_msg.src = 1
         server_msg.dest = 2
@@ -318,7 +565,6 @@ class LineFollower(Node):
         self.get_logger().info(f"Sent ACK to server -> uid={uid}")
 
     def teleop_override_callback(self, message):
-        """Tracks whether keyboard teleop currently has manual control."""
         if message.data != self.teleop_active:
             if message.data:
                 self.get_logger().info("Teleop override ENGAGED -- pausing autonomous drive commands.")
@@ -327,64 +573,51 @@ class LineFollower(Node):
         self.teleop_active = message.data
 
     def qr_detection_callback(self, message):
-        """
-        Receives QR codes scanned from the buildings.
-        
-        GUIDELINE (Patient/Hospital Identification):
-        - Parse the decoded string payload in `message.data` (e.g. "PATIENT_A", "HOSPITAL_B").
-        - If it matches your target destination, stop the vehicle close to the building (verify range using LIDAR),
-          perform the action (pick patient / drop patient), and communicate the arrival to the server.
-        """
         if self.state != self.STATE_EN_ROUTE:
-            return  # already busy with obstacle/zone handling -- ignore for now
+            return  
 
         self.get_logger().info(f"Heard QR code: {message.data}")
 
+        # Parse string like "{LOC: PATIENT_1}" -> "PATIENT_1"
         loc = self._parse_qr_loc(message.data)
         if loc is None:
             return
 
-        if loc != self.current_destination:
+        # Convert the current server target ('A') to the expected QR string ('PATIENT_1')
+        expected_loc = self.SIGN_TO_DESTINATION.get(self.current_destination)
+
+        if loc != expected_loc:
             self.get_logger().info(
-                f"Ignoring QR for {loc} -- not current target ({self.current_destination}).")
+                f"Ignoring QR for {loc} -- expected {expected_loc} (for target {self.current_destination}).")
             return
 
-        self.pending_qr_loc = loc
+        # Store the EXACT RAW TEXT from the QR to publish when we enter the zone
+        self.pending_qr_loc = message.data
         self.state = self.STATE_AWAITING_ZONE
-        self.get_logger().info(f"QR match for target {loc} -- watching for zone.")
+        self.get_logger().info(f"QR match for target {self.current_destination} ({loc}) -- watching for zone.")
 
     def _parse_qr_loc(self, payload):
-        """
-        Adapt this to the actual QR payload encoding.
-        Placeholder assumes something like "LOC: PATIENT_1".
-        """
+        """Extracts destination like PATIENT_1 from {LOC: PATIENT_1}"""
         try:
             return payload.split(': ')[-1].strip().strip('}')
         except Exception:
-            return None
+            return payload.strip()
 
     def sign_board_callback(self, message):
-        """
-        Receives traffic sign boards (e.g. "TURN_LEFT", "TURN_RIGHT", "TURN_STRAIGHT"
-        from the object recognizer).
-
-        GUIDELINE (Sign Board Routing):
-        - Use the detected signs to choose the quickest route at intersections.
-
-        Latching behavior: only act on a sign command while we're EN_ROUTE. The
-        first one we see moves us into STATE_SIGN_TURNING and latches the
-        direction; every sign message after that is ignored until something
-        moves us back out of STATE_SIGN_TURNING (the actual turn maneuver and
-        the reset back to EN_ROUTE are not implemented yet -- TBD).
-        """
-        if self.state != self.STATE_EN_ROUTE:
+        if self.lane_state not in (self.STATE_LANE, self.STATE_SIGN_WAITING):
             return
         
         self.get_logger().info(f"Heard Sign Board: {message.data}")
 
         self.latched_sign_direction = message.data
-        self.state = self.STATE_SIGN_TURNING
-        self.get_logger().info(f"Latched sign direction: '{self.latched_sign_direction}'.")
+
+        if self.latched_sign_direction == SIGN_STRAIGHT:
+            self.lane_state = self.STATE_LANE
+            self.get_logger().info("Sign is STRAIGHT. Bypassing wait and directly continuing in lane.")
+        else:
+            self.lane_state = self.STATE_SIGN_WAITING
+            self.get_logger().info(f"Latched sign direction: '{self.latched_sign_direction}'. Waiting for poles.")
+
 
 def main(args=None):
     rclpy.init(args=args)

@@ -81,7 +81,7 @@ class QRDetector(Node):
         # --- Method 1: Using OpenCV Built-in QR Detector ---
         try:
             detector = cv2.QRCodeDetector()
-            data, bbox, straight_qrcode = detector.detectAndDecode(image)
+            data, bbox, _ = detector.detectAndDecode(image)
             if bbox is not None and data != "":
                 return data
         except Exception as e:
