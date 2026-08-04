@@ -170,6 +170,11 @@ class LineFollower(Node):
 
         self.own_uid = 0              
         self.awaiting_ack_uid = None  
+        
+        # ------------------ Server Communication Retry Variables ------------------
+        self.server_retry_count = 0
+        self.last_sent_msg_text = ""
+        self.server_retry_timer = None
 
         self.latched_sign_direction = None
         self.latest_ranges = []
@@ -549,10 +554,24 @@ class LineFollower(Node):
             if message.uid == self.awaiting_ack_uid:
                 self.get_logger().info(f"Server ACKed our report (uid={message.uid}).")
                 self.awaiting_ack_uid = None
+                
+                # Cancel the retry loop once acknowledged
+                if self.server_retry_timer is not None:
+                    self.server_retry_timer.cancel()
             return
 
         if raw_msg != "":
             self._send_ack(message.uid)
+
+            # Special message handling for validation and parking logic
+            if raw_msg == "INVALID":
+                self.get_logger().warn("Received INVALID from server! Proceeding as per rules (negative marking).")
+                return
+            elif raw_msg == "OK":
+                self.get_logger().info("Received OK confirmation from server.")
+                if self.current_destination == "Z":
+                    self.mission_completed = True
+                return
 
             self.current_destination = raw_msg
             self.get_logger().info(f"New destination assigned: {self.current_destination}")
@@ -570,18 +589,44 @@ class LineFollower(Node):
         self.get_logger().info(f"Published target_destination: '{target_sign}'")
 
     def send_server_update(self, text_msg):
+        self.last_sent_msg_text = text_msg
+        self.awaiting_ack_uid = self.own_uid
+        self.server_retry_count = 0
+        
+        # Publish initially
+        self._publish_server_msg()
+        
+        # Reset and restart the retry timer
+        if self.server_retry_timer is not None:
+            self.server_retry_timer.cancel()
+            
+        self.server_retry_timer = self.create_timer(1.0, self._server_retry_callback)
+
+        self.own_uid = (self.own_uid + 1) % 256
+        
+    def _publish_server_msg(self):
         server_msg = ServerCommunication()
         server_msg.src = 1       
         server_msg.dest = 2      
-        server_msg.uid = self.own_uid
+        server_msg.uid = self.awaiting_ack_uid
         server_msg.ack = 0
-        server_msg.msg = text_msg
+        server_msg.msg = self.last_sent_msg_text
         self.publisher_server.publish(server_msg)
         self.get_logger().info(
-            f"Sent to server -> uid={server_msg.uid} ack={server_msg.ack} msg='{server_msg.msg}'")
+            f"Sent to server -> uid={server_msg.uid} ack={server_msg.ack} msg='{server_msg.msg}' (Attempt: {self.server_retry_count + 1})")
 
-        self.awaiting_ack_uid = self.own_uid
-        self.own_uid = (self.own_uid + 1) % 256
+    def _server_retry_callback(self):
+        # 1-second interval retry loop
+        if self.awaiting_ack_uid is not None:
+            self.server_retry_count += 1
+            if self.server_retry_count <= 5:
+                self.get_logger().warn(f"No ACK received from server. Retrying message... ({self.server_retry_count}/5)")
+                self._publish_server_msg()
+            else:
+                self.get_logger().error("Server did not ACK after 5 retries. Assuming disconnected. Run stopped.")
+                self.awaiting_ack_uid = None
+                if self.server_retry_timer is not None:
+                    self.server_retry_timer.cancel()
 
     def _send_ack(self, uid):
         server_msg = ServerCommunication()
