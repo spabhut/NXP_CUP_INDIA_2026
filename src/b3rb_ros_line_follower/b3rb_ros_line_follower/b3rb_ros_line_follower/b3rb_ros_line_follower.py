@@ -34,7 +34,7 @@ TURN_MAX = 1.0
 # Speeds & Turn Rates
 LANE_SPEED = 1.0
 AWAIT_SPEED = 0.5
-TURN_SPEED = 0.5
+TURN_SPEED = 0.35
 TURN_OMEGA = 0.8
 POLE_DIST_THRESHOLD = 1.5
 
@@ -252,7 +252,7 @@ class LineFollower(Node):
         if self.obstacle_active and self.avoidance_side is not None:
             # Force the buggy to hug the designated safe side
             turn = self._steer_pid_side(message, width, half_width, self.avoidance_side)
-            OBSTACLE_SPEED = 0.2
+            OBSTACLE_SPEED = 0.1
             self.rover_move_manual_mode(OBSTACLE_SPEED, turn)
             return
         # -------------------------------------------------------------------------------------
@@ -379,12 +379,13 @@ class LineFollower(Node):
                 if right_x is None or x > right_x:
                     right_x = x
 
-        offset = 0.75 * half_width 
+        offset = 0.5 * half_width
+        TURN_AGRESSION = 1.5 
 
         if side == 'LEFT':
             if left_x is not None:
                 # INVERTED: To hug left, force the left line to the right side of the screen
-                midpoint = left_x - offset 
+                midpoint = left_x + offset 
                 error = (half_width - midpoint) / half_width
             else:
                 error = 1.0  # Steer HARD left
@@ -392,13 +393,15 @@ class LineFollower(Node):
         elif side == 'RIGHT':
             if right_x is not None:
                 # INVERTED: To hug right, force the right line to the left side of the screen
-                midpoint = right_x + offset 
+                midpoint = right_x - offset 
                 error = (half_width - midpoint) / half_width
+                error *= TURN_AGRESSION
             else:
                 error = -1.0 # Steer HARD right
                 
         else:
             return self._last_turn
+        error = float(max(min(error, 1.0), -1.0))
 
         return self._update_lane_pid(error)
 
@@ -435,7 +438,7 @@ class LineFollower(Node):
         if self.obstacle_active:
             # Map the current steering command (-1.0 to 1.0) to a degree shift. 
             # Negative turn (Right) shifts sectors Left (+) to stay aligned with the road.
-            MAX_OFFSET_DEG = -40  # You can tune this maximum degree offset if needed
+            MAX_OFFSET_DEG = -44  # You can tune this maximum degree offset if needed
             offset = int(-self.target_turn * MAX_OFFSET_DEG)
             base_center += offset
 
@@ -443,8 +446,8 @@ class LineFollower(Node):
         front_center = self._sector_occupancy_ratio(ranges, num_readings, base_center - 10, base_center + 10, 1.2)
         front_right  = self._sector_occupancy_ratio(ranges, num_readings, base_center - 20, base_center , 1.2)
         front_left   = self._sector_occupancy_ratio(ranges, num_readings, base_center, base_center + 20, 1.2)
-        front_left_check = self._sector_occupancy_ratio(ranges, num_readings, base_center + 30, base_center + 140, 1.2)
-        front_right_check = self._sector_occupancy_ratio(ranges, num_readings, base_center - 140, base_center - 30, 1.2)
+        front_left_check = self._sector_occupancy_ratio(ranges, num_readings, base_center + 40, base_center + 120, 1.2)
+        front_right_check = self._sector_occupancy_ratio(ranges, num_readings, base_center - 120, base_center - 40, 1.2)
         # Wide Side regions to detect clearance (threshold = 1.0m) dynamically shifted
         side_right = self._sector_occupancy_ratio(ranges, num_readings, base_center - 120, base_center - 60, 1.0)
         side_left  = self._sector_occupancy_ratio(ranges, num_readings, base_center + 60, base_center + 120, 1.0)
@@ -463,7 +466,7 @@ class LineFollower(Node):
                 self.get_logger().info(f"[OBSTACLE DEBUG] Obstacle detected in CENTER. Chose to avoid by hugging {self.avoidance_side}.")
                     
             # CASE 2: Object predominantly on the right
-            elif front_right >= 0.2:
+            elif front_right >= 0.18:
                 self.obstacle_active = True
                 self.avoidance_side = 'LEFT'  # Hug the left line
                 
@@ -471,7 +474,7 @@ class LineFollower(Node):
                 self.get_logger().info("[OBSTACLE DEBUG] Obstacle detected on RIGHT. Chose to avoid by hugging LEFT.")
                 
             # CASE 3: Object predominantly on the left
-            elif front_left >= 0.2:
+            elif front_left >= 0.18:
                 self.obstacle_active = True
                 self.avoidance_side = 'RIGHT' # Hug the right line
                 
