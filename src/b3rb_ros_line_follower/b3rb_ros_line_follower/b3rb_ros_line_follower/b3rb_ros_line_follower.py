@@ -268,8 +268,12 @@ class LineFollower(Node):
             if self.pole_timer_start is not None:
                 elapsed = (self.get_clock().now() - self.pole_timer_start).nanoseconds / 1e9
             
-            # Cooldown of 0.5 seconds prevents triggering on the entrance poles immediately 
-            if elapsed > 1.0 and self._check_poles():
+            # Timeout safeguard: return to lane if turning takes more than 15.0 seconds
+            if elapsed > 15.0:
+                self.get_logger().warn("Sign turning timeout (15.0s) reached! Forcing back to lane.")
+                self.lane_state = self.STATE_LANE
+            # Cooldown of 1.0 seconds prevents triggering on the entrance poles immediately 
+            elif elapsed > 1.0 and self._check_poles():
                 self.get_logger().info("Cross poles detected, returning to lane.")
                 self.lane_state = self.STATE_LANE
 
@@ -278,11 +282,8 @@ class LineFollower(Node):
                 self.lane_state = self.STATE_LANE
 
             elif message.vector_count == 1:
-                top_x = message.vector_1[0].x
-                bottom_x = message.vector_1[1].x
-                
-                top_left = top_x < half_width
-                bottom_left = bottom_x < half_width
+                top_left = message.vector_1[0].x < half_width
+                bottom_left = message.vector_1[1].x < half_width
 
                 if self.lane_state == self.STATE_LANE:
                     # Check if this single boundary indicates a sharp turn or not.
@@ -290,7 +291,7 @@ class LineFollower(Node):
                         message.vector_1[0].x, message.vector_1[0].y,
                         message.vector_1[1].x, message.vector_1[1].y)
                     if slope_deg < SLOPE_ANGLE_SHARP_DEG:
-                        self.turn_dir = 1.0 if (top_x < bottom_x) else -1.0
+                        self.turn_dir = -1.0 if bottom_left else 1.0
                         self.lane_state = (
                             self.STATE_SHARP_WAITING if top_left == bottom_left
                             else self.STATE_SHARP_TURNING)
@@ -312,7 +313,7 @@ class LineFollower(Node):
             self.target_speed = TURN_SPEED
             
         elif self.lane_state == self.STATE_SIGN_WAITING:
-            turn = 0.0  
+            turn = self._steer_pid(message, width, half_width)  
             self.target_speed = AWAIT_SPEED
             
         elif self.lane_state == self.STATE_SIGN_TURNING:
@@ -617,7 +618,7 @@ class LineFollower(Node):
                 f"Ignoring QR for {loc} -- expected {expected_loc} (for target {self.current_destination}).")
             return
 
-        self.pending_qr_loc = message.data
+        self.pending_qr_loc = self.current_destination
         self.state = self.STATE_AWAITING_ZONE
         self.get_logger().info(f"QR match for target {self.current_destination} ({loc}) -- watching for zone.")
 
